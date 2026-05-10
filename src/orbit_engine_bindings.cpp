@@ -1,3 +1,12 @@
+/**
+ * @file orbit_engine_bindings.cpp
+ * @brief pybind11 bridge between Kaggle Python observations and the native engine.
+ *
+ * The bridge accepts dictionary-style and attribute-style observations, copies
+ * rows into fixed-capacity native buffers, and returns plain Python launch lists.
+ * All capacity checks happen here before data reaches the zero-allocation C++
+ * simulator/search hot path.
+ */
 #include "orbit_engine.hpp"
 
 #include "geometry.hpp"
@@ -12,6 +21,13 @@ namespace py = pybind11;
 
 namespace {
 
+/**
+ * @brief Read a named field from a Python dict or attribute object.
+ * @param obj Python observation-like object.
+ * @param name Field name to read.
+ * @return Borrowed field value, or None when absent.
+ * @note Kaggle can provide dict-like observations while tests use namespaces.
+ */
 py::object get_field(const py::handle& obj, const char* name) {
     if (py::isinstance<py::dict>(obj)) {
         py::dict dict = py::reinterpret_borrow<py::dict>(obj);
@@ -26,6 +42,13 @@ py::object get_field(const py::handle& obj, const char* name) {
     return py::none();
 }
 
+/**
+ * @brief Read an integer field with fallback.
+ * @param obj Python object to inspect.
+ * @param name Field name.
+ * @param fallback Value to return when the field is absent.
+ * @return Cast integer value or fallback.
+ */
 int get_int_field(const py::handle& obj, const char* name, int fallback) {
     py::object value = get_field(obj, name);
     if (value.is_none()) {
@@ -34,6 +57,13 @@ int get_int_field(const py::handle& obj, const char* name, int fallback) {
     return py::cast<int>(value);
 }
 
+/**
+ * @brief Read a floating-point field with fallback.
+ * @param obj Python object to inspect.
+ * @param name Field name.
+ * @param fallback Value to return when the field is absent.
+ * @return Cast double value or fallback.
+ */
 double get_double_field(const py::handle& obj, const char* name, double fallback) {
     py::object value = get_field(obj, name);
     if (value.is_none()) {
@@ -42,6 +72,12 @@ double get_double_field(const py::handle& obj, const char* name, double fallback
     return py::cast<double>(value);
 }
 
+/**
+ * @brief Parse one planet row into native observation storage.
+ * @param item Python sequence [id, owner, x, y, radius, ships, production].
+ * @param out Output planet observation.
+ * @return true when the row has the expected minimum length.
+ */
 bool parse_planet(const py::handle& item, orbit::PlanetObservation& out) {
     py::sequence seq = py::reinterpret_borrow<py::sequence>(item);
     if (py::len(seq) < 7) {
@@ -57,6 +93,12 @@ bool parse_planet(const py::handle& item, orbit::PlanetObservation& out) {
     return true;
 }
 
+/**
+ * @brief Parse one fleet row into native observation storage.
+ * @param item Python sequence [id, owner, x, y, angle, from_planet_id, ships].
+ * @param out Output fleet observation.
+ * @return true when the row has the expected minimum length.
+ */
 bool parse_fleet(const py::handle& item, orbit::FleetObservation& out) {
     py::sequence seq = py::reinterpret_borrow<py::sequence>(item);
     if (py::len(seq) < 7) {
@@ -72,6 +114,13 @@ bool parse_fleet(const py::handle& item, orbit::FleetObservation& out) {
     return true;
 }
 
+/**
+ * @brief Parse current or initial planet rows into fixed observation arrays.
+ * @param obj Python sequence of planet rows, or None.
+ * @param obs Observation being populated.
+ * @param initial true to populate initial_planets, false for current planets.
+ * @note Count is clamped to MAX_PLANETS before entering native state loading.
+ */
 void parse_planets(const py::object& obj, orbit::ObservationInput& obs, bool initial) {
     if (obj.is_none()) {
         return;
@@ -91,6 +140,12 @@ void parse_planets(const py::object& obj, orbit::ObservationInput& obs, bool ini
     }
 }
 
+/**
+ * @brief Parse fleet rows into the fixed observation fleet array.
+ * @param obj Python sequence of fleet rows, or None.
+ * @param obs Observation being populated.
+ * @note Count is clamped to MAX_FLEETS, matching FleetSoA capacity.
+ */
 void parse_fleets(const py::object& obj, orbit::ObservationInput& obs) {
     if (obj.is_none()) {
         return;
@@ -105,6 +160,12 @@ void parse_fleets(const py::object& obj, orbit::ObservationInput& obs) {
     }
 }
 
+/**
+ * @brief Parse comet planet id markers from Python.
+ * @param obj Python sequence of planet ids, or None.
+ * @param obs Observation being populated.
+ * @note These ids later override orbiting metadata and attach path slots.
+ */
 void parse_comet_ids(const py::object& obj, orbit::ObservationInput& obs) {
     if (obj.is_none()) {
         return;
@@ -117,6 +178,13 @@ void parse_comet_ids(const py::object& obj, orbit::ObservationInput& obs) {
     }
 }
 
+/**
+ * @brief Parse active comet group path data from Python.
+ * @param obj Python sequence of group objects, or None.
+ * @param obs Observation being populated.
+ * @note Paths are flattened by slot then point so interpolation uses direct
+ *       fixed-array indexing during solve_intercept and simulation.
+ */
 void parse_comets(const py::object& obj, orbit::ObservationInput& obs) {
     if (obj.is_none()) {
         return;
@@ -159,6 +227,13 @@ void parse_comets(const py::object& obj, orbit::ObservationInput& obs) {
     }
 }
 
+/**
+ * @brief Convert a Python observation into the native fixed-buffer input type.
+ * @param raw Python dict or attribute object with Orbit Wars fields.
+ * @return Fully populated ObservationInput with safe defaults.
+ * @note If initial_planets is absent, current planets are copied so orbital
+ *       reconstruction remains well-defined.
+ */
 orbit::ObservationInput make_observation(const py::object& raw) {
     orbit::ObservationInput obs{};
     obs.player = get_int_field(raw, "player", 0);
@@ -179,6 +254,12 @@ orbit::ObservationInput make_observation(const py::object& raw) {
     return obs;
 }
 
+/**
+ * @brief Convert Python launch rows into a native LaunchList.
+ * @param raw Python sequence of [from_planet_id, angle, ships], or None.
+ * @return Fixed-capacity launch list.
+ * @note Invalid short rows are skipped and total count is clamped.
+ */
 orbit::LaunchList make_launches(const py::object& raw) {
     orbit::LaunchList out{};
     out.clear();
@@ -197,6 +278,11 @@ orbit::LaunchList make_launches(const py::object& raw) {
     return out;
 }
 
+/**
+ * @brief Convert a native LaunchList into Kaggle action rows.
+ * @param launches Native fixed-buffer launch list.
+ * @return Python list [[from_planet_id, angle, ships], ...].
+ */
 py::list launch_list_to_python(const orbit::LaunchList& launches) {
     py::list out;
     for (int i = 0; i < launches.count; ++i) {
@@ -210,6 +296,12 @@ py::list launch_list_to_python(const orbit::LaunchList& launches) {
     return out;
 }
 
+/**
+ * @brief Convert native state into a Python debug dictionary.
+ * @param state Native game state.
+ * @return Python dictionary exposing live planets and fleets.
+ * @note This is for tests/debugging only; search does not call back into Python.
+ */
 py::dict debug_state_to_python(const orbit::GameState& state) {
     py::dict out;
     out["player"] = state.player;
@@ -256,26 +348,54 @@ py::dict debug_state_to_python(const orbit::GameState& state) {
     return out;
 }
 
+/// @brief Thin Python-owned wrapper around orbit::Engine.
 class PyEngine {
 public:
+    /**
+     * @brief Construct a Python engine wrapper.
+     * @param player Controlled player id.
+     */
     explicit PyEngine(int player = 0) : engine(player) {}
 
+    /**
+     * @brief Replace native state from a Python observation.
+     * @param obs Python dict or attribute-style observation.
+     */
     void update_observation(const py::object& obs) {
         engine.update_observation(make_observation(obs));
     }
 
+    /**
+     * @brief Run native search and return Kaggle action rows.
+     * @param time_budget_ms Per-turn time budget in milliseconds.
+     * @param seed Deterministic seed for search.
+     * @return Python list of launch rows.
+     */
     py::list choose_actions(int time_budget_ms = 900, uint64_t seed = 0) {
         return launch_list_to_python(engine.choose_actions(time_budget_ms, seed));
     }
 
+    /**
+     * @brief Step the native simulator with explicit Python launch rows.
+     * @param launches Python sequence of launch rows.
+     */
     void step(const py::object& launches) {
         engine.step_actions(make_launches(launches));
     }
 
+    /**
+     * @brief Return a Python representation of live native state.
+     * @return Debug dictionary for tests and local inspection.
+     */
     py::dict debug_state() const {
         return debug_state_to_python(engine.sim.state);
     }
 
+    /**
+     * @brief Score the current native state.
+     * @param player Player id, or -1 for the engine player.
+     * @return Heuristic evaluation score.
+     */
     double debug_evaluate(int player = -1) const {
         return engine.debug_evaluate(player);
     }
@@ -286,18 +406,30 @@ private:
 
 }  // namespace
 
+/**
+ * @brief Define the Python orbit_engine extension module.
+ * @param m pybind11 module object.
+ * @note The exposed API intentionally stays small to keep Kaggle entrypoint
+ *       overhead below the native search budget.
+ */
 PYBIND11_MODULE(orbit_engine, m) {
     m.doc() = "Fixed-buffer C++ engine for Kaggle Orbit Wars.";
     m.attr("__version__") = "0.1.0";
 
     py::class_<PyEngine>(m, "Engine")
         .def(py::init<int>(), py::arg("player") = 0)
-        .def("update_observation", &PyEngine::update_observation, py::arg("obs"))
+        .def("update_observation", &PyEngine::update_observation, py::arg("obs"),
+             "Load a dict or attribute-style Orbit Wars observation into native buffers.")
         .def("choose_actions", &PyEngine::choose_actions,
-             py::arg("time_budget_ms") = 900, py::arg("seed") = 0)
-        .def("step", &PyEngine::step, py::arg("launches"))
-        .def("debug_state", &PyEngine::debug_state)
-        .def("debug_evaluate", &PyEngine::debug_evaluate, py::arg("player") = -1);
+             py::arg("time_budget_ms") = 900, py::arg("seed") = 0,
+             "Run fixed-buffer native search and return Kaggle launch rows.")
+        .def("step", &PyEngine::step, py::arg("launches"),
+             "Advance the native simulator using Python launch rows.")
+        .def("debug_state", &PyEngine::debug_state,
+             "Return live planets and fleets from the native simulator.")
+        .def("debug_evaluate", &PyEngine::debug_evaluate, py::arg("player") = -1,
+             "Evaluate the native state for a player.");
 
-    m.def("speed_for_ships", &orbit::speed_for_ships, py::arg("ships"));
+    m.def("speed_for_ships", &orbit::speed_for_ships, py::arg("ships"),
+          "Return the Orbit Wars rule speed for a fleet size.");
 }

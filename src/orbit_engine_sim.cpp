@@ -1,3 +1,12 @@
+/**
+ * @file orbit_engine_sim.cpp
+ * @brief Fixed-buffer Orbit Wars simulator and turn-order implementation.
+ *
+ * The simulator mirrors the Kaggle rules closely enough for search rollouts:
+ * comet expiration, launch legality, production, continuous fleet movement,
+ * moving-planet sweeps, combat, and terminal checks. All transient state uses
+ * stack or fixed arrays so cloned rollouts remain predictable.
+ */
 #include "orbit_engine.hpp"
 
 #include "geometry.hpp"
@@ -9,14 +18,24 @@
 namespace orbit {
 namespace {
 
+/// @brief Per-source launch spending accumulator for one turn.
 struct SourceSpend {
+    ///< Ships already spent from each planet SoA slot.
     std::array<int, MAX_PLANETS> spent{};
 
+    /// @brief Reset all spend counters.
+    /// @note O(MAX_PLANETS), fixed-bounded.
     void clear() {
         spent.fill(0);
     }
 };
 
+/**
+ * @brief Remove comet planets that have left the valid observed path or board.
+ * @param state Mutable game state.
+ * @note Comets expire before launches, matching the rule that departing comets
+ *       cannot be used as sources on the current turn.
+ */
 void expire_comets(GameState& state) {
     for (int i = 0; i < state.planets.count; ++i) {
         if (state.planets.alive[static_cast<size_t>(i)] == 0 ||
@@ -41,6 +60,13 @@ void expire_comets(GameState& state) {
     }
 }
 
+/**
+ * @brief Validate and instantiate launch orders as fleets.
+ * @param state Mutable game state.
+ * @param launches Joint launch list for this turn.
+ * @note SourceSpend prevents multiple orders from overspending one garrison
+ *       while keeping validation allocation-free.
+ */
 void process_launches(GameState& state, const LaunchList& launches) {
     SourceSpend spend{};
     spend.clear();
@@ -69,6 +95,11 @@ void process_launches(GameState& state, const LaunchList& launches) {
     }
 }
 
+/**
+ * @brief Apply per-turn production to every live owned planet.
+ * @param state Mutable game state.
+ * @note Production happens after launches so freshly spent ships are not reused.
+ */
 void produce(GameState& state) {
     for (int i = 0; i < state.planets.count; ++i) {
         if (state.planets.alive[static_cast<size_t>(i)] != 0 &&
@@ -78,6 +109,13 @@ void produce(GameState& state) {
     }
 }
 
+/**
+ * @brief Resolve all fleet arrivals queued against planets this tick.
+ * @param state Mutable game state.
+ * @param queue Dense planet-owner arrival matrix.
+ * @note Arrivals fight each other first; only a unique survivor contests or
+ *       reinforces the planet garrison.
+ */
 void resolve_planet_combats(GameState& state, const CombatQueue& queue) {
     for (int p = 0; p < state.planets.count; ++p) {
         if (state.planets.alive[static_cast<size_t>(p)] == 0) {
@@ -125,6 +163,13 @@ void resolve_planet_combats(GameState& state, const CombatQueue& queue) {
     }
 }
 
+/**
+ * @brief Move all fleets one tick and queue direct planet collisions.
+ * @param state Mutable game state.
+ * @param queue Combat queue receiving planet arrivals.
+ * @note Each fleet segment is tested continuously against the sun, board exit,
+ *       and all live planets; the earliest collision wins.
+ */
 void move_fleets(GameState& state, CombatQueue& queue) {
     for (int f = 0; f < state.fleets.count; ++f) {
         if (state.fleets.alive[static_cast<size_t>(f)] == 0) {
@@ -163,6 +208,8 @@ void move_fleets(GameState& state, CombatQueue& queue) {
                                     (best_planet < 0 ||
                                      state.planets.id[static_cast<size_t>(p)] <
                                          state.planets.id[static_cast<size_t>(best_planet)]);
+            // Equal-time planet hits are made deterministic by planet id. This
+            // avoids worker-to-worker divergence when a fleet grazes two bodies.
             if (earlier || tie_planet) {
                 best_t = t;
                 best_planet = p;
@@ -185,6 +232,14 @@ void move_fleets(GameState& state, CombatQueue& queue) {
     }
 }
 
+/**
+ * @brief Advance orbiting planets and comets, sweeping them over fleet points.
+ * @param state Mutable game state.
+ * @param old_pos Planet centers before body motion.
+ * @param queue Combat queue receiving swept fleet arrivals.
+ * @note Fleets move first; this pass catches stationary fleet positions that
+ *       are overtaken by a moving planet or comet during the same tick.
+ */
 void advance_planets_and_comets(GameState& state, const std::array<Vec2, MAX_PLANETS>& old_pos,
                                 CombatQueue& queue) {
     for (int g = 0; g < state.comets.group_count; ++g) {
@@ -245,6 +300,12 @@ void advance_planets_and_comets(GameState& state, const std::array<Vec2, MAX_PLA
     }
 }
 
+/**
+ * @brief Update done/winner flags after a completed turn.
+ * @param state Mutable game state.
+ * @note Active-player checks include both planets and fleets, matching
+ *       elimination semantics.
+ */
 void update_terminal(GameState& state) {
     int active_count = 0;
     int last_owner = -1;
@@ -262,14 +323,27 @@ void update_terminal(GameState& state) {
 
 }  // namespace
 
+/**
+ * @brief Reset the simulator state.
+ */
 void OrbitSim::reset() {
     state.reset();
 }
 
+/**
+ * @brief Load a new observation into the simulator.
+ * @param obs Fixed-buffer observation input.
+ */
 void OrbitSim::load_from_observation(const ObservationInput& obs) {
     state.load_from_observation(obs);
 }
 
+/**
+ * @brief Advance the game by one rule-ordered tick.
+ * @param launches Joint launch list to apply before production.
+ * @note The sequence is intentionally explicit so search rollouts remain
+ *       faithful to the competition rule ordering.
+ */
 void OrbitSim::step(const LaunchList& launches) {
     if (state.done) {
         return;

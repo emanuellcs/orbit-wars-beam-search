@@ -1,3 +1,6 @@
+# Development and CI dependencies for building the pybind11 extension, running
+# regression tests, smoke-testing Kaggle integration, and experimenting with
+# search/evaluator tuning.
 pybind11>=2.13
 numpy>=2.0
 pytest>=8.0

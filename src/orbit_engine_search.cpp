@@ -1,3 +1,11 @@
+/**
+ * @file orbit_engine_search.cpp
+ * @brief Root-parallel fixed-buffer macro-action search.
+ *
+ * The search evaluates a bounded ranked frontier of macro-actions, simulates a
+ * deterministic tactical prefix plus rollout for each, and returns the best
+ * legal launch list before the hard deadline.
+ */
 #include "search.hpp"
 
 #include "candidate.hpp"
@@ -13,6 +21,12 @@
 namespace orbit {
 namespace {
 
+/**
+ * @brief Append one launch list into another.
+ * @param dst Destination launch list.
+ * @param src Source launch list.
+ * @note LaunchList::add enforces the fixed output capacity.
+ */
 void append_launches(LaunchList& dst, const LaunchList& src) {
     for (int i = 0; i < src.count; ++i) {
         const Launch& launch = src.launches[static_cast<size_t>(i)];
@@ -20,6 +34,13 @@ void append_launches(LaunchList& dst, const LaunchList& src) {
     }
 }
 
+/**
+ * @brief Add deterministic actions for all active owners except one.
+ * @param state Current game state.
+ * @param joint Joint launch list to append into.
+ * @param skip_owner Owner id whose actions are already supplied.
+ * @note Used to make the root candidate face plausible opponent pressure.
+ */
 void fill_deterministic_joint(const GameState& state, LaunchList& joint, int skip_owner) {
     for (int owner = 0; owner < MAX_PLAYERS; ++owner) {
         if (owner == skip_owner || !state.is_active_player(owner)) {
@@ -29,6 +50,17 @@ void fill_deterministic_joint(const GameState& state, LaunchList& joint, int ski
     }
 }
 
+/**
+ * @brief Roll out and score one macro-action from the root state.
+ * @param root Root game state.
+ * @param player Controlled player id.
+ * @param macro Candidate macro-action to evaluate.
+ * @param config Clamped search configuration.
+ * @param seed Deterministic branch seed.
+ * @return Heuristic score after deterministic simulation.
+ * @note GameState copies are value copies of fixed arrays, avoiding runtime
+ *       allocation while allowing each worker to mutate an independent state.
+ */
 double evaluate_macro(const GameState& root, int player, const MacroAction& macro,
                       const SearchConfig& config, uint64_t seed) {
     (void)seed;
@@ -64,6 +96,12 @@ double evaluate_macro(const GameState& root, int player, const MacroAction& macr
     return evaluate_state(sim.state, player) + macro.score * 0.05;
 }
 
+/**
+ * @brief Produce a legal fallback action from the highest-priority macro.
+ * @param macros Packed macro-action list.
+ * @return Launch list from the best macro, or empty if no macro exists.
+ * @note This guards timeout cases so the agent still returns validated actions.
+ */
 LaunchList validated_fallback(const MacroActionList& macros) {
     LaunchList out{};
     out.clear();
@@ -75,6 +113,16 @@ LaunchList validated_fallback(const MacroActionList& macros) {
 
 }  // namespace
 
+/**
+ * @brief Choose a launch list by evaluating bounded root macro-actions.
+ * @param state Current game state.
+ * @param requested_config Search configuration requested by the caller.
+ * @param time_budget_ms External budget in milliseconds.
+ * @param seed Deterministic seed used to mix worker/candidate ids.
+ * @return Best-scoring launch list or a legal fallback.
+ * @note Worker count, beam width, depth, and horizon are clamped to preserve the
+ *       fixed-buffer and deadline contracts.
+ */
 LaunchList beam_search_action(const GameState& state, const SearchConfig& requested_config,
                               int time_budget_ms, uint64_t seed) {
     SearchConfig config = requested_config;
@@ -105,6 +153,8 @@ LaunchList beam_search_action(const GameState& state, const SearchConfig& reques
             if (index >= candidate_count) {
                 break;
             }
+            // Check every eight candidates to keep the hot loop cheap while
+            // still respecting the 900 ms action deadline with a small margin.
             if ((index & 7) == 0 && std::chrono::steady_clock::now() >= deadline) {
                 break;
             }

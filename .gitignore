@@ -1,3 +1,6 @@
+# Ignore generated build products, caches, local tooling state, and submission
+# bundles so the repository tracks only source, tests, rules, and configuration.
+
 # Prerequisites
 *.d
 

@@ -1,4 +1,9 @@
-"""Regression tests for the Orbit Wars fixed-buffer engine."""
+"""Regression tests for the Orbit Wars fixed-buffer engine.
+
+The suite checks physics fidelity, observation parsing, search legality,
+packaging, and Kaggle smoke behavior. It also guards the native hot path against
+accidental use of dynamic-allocation primitives.
+"""
 
 from __future__ import annotations
 
@@ -17,11 +22,26 @@ import package_submission
 
 
 def load_engine():
+    """Ensure the native extension is available and return the module."""
+
     assert main._ensure_native_engine()
     return main.orbit_engine
 
 
 def obs(planets, fleets=None, **extra):
+    """Build a dict-style Orbit Wars observation for tests.
+
+    Args:
+        planets: Planet rows ``[id, owner, x, y, radius, ships, production]``.
+        fleets: Optional fleet rows
+            ``[id, owner, x, y, angle, from_planet_id, ships]``.
+        **extra: Optional overrides for player, step, angular velocity,
+            initial planets, comet ids, comet paths, and overage time.
+
+    Returns:
+        dict: Complete observation accepted by ``main.agent`` and pybind11.
+    """
+
     data = {
         "player": extra.get("player", 0),
         "step": extra.get("step", 0),
@@ -37,6 +57,8 @@ def obs(planets, fleets=None, **extra):
 
 
 def make_engine(observation):
+    """Create and initialize a native Engine from a test observation."""
+
     orbit_engine = load_engine()
     engine = orbit_engine.Engine(int(observation.get("player", 0)))
     engine.update_observation(observation)
@@ -44,6 +66,8 @@ def make_engine(observation):
 
 
 def planet_by_id(state, planet_id):
+    """Return a debug-state planet dict by id or fail the test."""
+
     for planet in state["planets"]:
         if planet["id"] == planet_id:
             return planet
@@ -51,10 +75,14 @@ def planet_by_id(state, planet_id):
 
 
 def total_launched_from(actions, planet_id):
+    """Sum ships launched from one planet id in an action list."""
+
     return sum(int(row[2]) for row in actions if int(row[0]) == planet_id)
 
 
 def test_speed_formula_matches_rules():
+    """Verify the native speed curve matches key Orbit Wars rule anchors."""
+
     orbit_engine = load_engine()
     assert orbit_engine.speed_for_ships(1) == pytest.approx(1.0)
     assert orbit_engine.speed_for_ships(1000) == pytest.approx(6.0)
@@ -62,6 +90,8 @@ def test_speed_formula_matches_rules():
 
 
 def test_observation_parses_orbiting_static_and_comets():
+    """Verify observation loading classifies orbiting, static, and comet planets."""
+
     observation = obs(
         [
             [0, 0, 60.0, 50.0, 1.0, 20, 2],
@@ -79,6 +109,8 @@ def test_observation_parses_orbiting_static_and_comets():
 
 
 def test_launch_spend_legality_and_production_ordering():
+    """Reject overspending launches and apply production after launch spending."""
+
     engine = make_engine(
         obs(
             [
@@ -95,6 +127,8 @@ def test_launch_spend_legality_and_production_ordering():
 
 
 def test_sun_occlusion_removes_crossing_fleet():
+    """Remove a fleet whose continuous segment crosses the sun radius."""
+
     engine = make_engine(
         obs(
             [[0, 0, 20.0, 20.0, 2.0, 10, 1]],
@@ -106,6 +140,8 @@ def test_sun_occlusion_removes_crossing_fleet():
 
 
 def test_planet_collision_resolves_capture():
+    """Queue a fleet-planet collision and resolve the capture."""
+
     engine = make_engine(
         obs(
             [[0, -1, 21.0, 50.0, 1.0, 0, 1]],
@@ -119,6 +155,8 @@ def test_planet_collision_resolves_capture():
 
 
 def test_moving_comet_sweeps_stationary_fleet_position():
+    """Capture fleets swept by a moving comet between path samples."""
+
     comet_path = [[[10.0, 10.0], [12.0, 10.0]]]
     engine = make_engine(
         obs(
@@ -135,6 +173,8 @@ def test_moving_comet_sweeps_stationary_fleet_position():
 
 
 def test_tied_attackers_destroy_each_other_without_capture():
+    """Keep ownership unchanged when top attacking forces tie."""
+
     engine = make_engine(
         obs(
             [[3, -1, 80.0, 80.0, 2.0, 10, 1]],
@@ -151,6 +191,8 @@ def test_tied_attackers_destroy_each_other_without_capture():
 
 
 def test_static_interception_action_format_and_angle():
+    """Return a valid launch toward a static target with an expected heading."""
+
     engine = make_engine(
         obs(
             [
@@ -171,6 +213,8 @@ def test_static_interception_action_format_and_angle():
 
 
 def test_macro_packer_does_not_overspend_source():
+    """Ensure packed macro-actions respect per-source ship availability."""
+
     engine = make_engine(
         obs(
             [
@@ -185,6 +229,8 @@ def test_macro_packer_does_not_overspend_source():
 
 
 def test_main_agent_returns_orbit_wars_action_list():
+    """Verify the Kaggle entrypoint returns launch rows of the required shape."""
+
     observation = obs(
         [
             [0, 0, 10.0, 10.0, 2.0, 30, 2],
@@ -197,6 +243,8 @@ def test_main_agent_returns_orbit_wars_action_list():
 
 
 def test_hot_sources_avoid_dynamic_allocation_primitives():
+    """Guard search/simulator hot files against allocation-heavy primitives."""
+
     hot_files = [
         "src/orbit_engine_sim.cpp",
         "src/orbit_engine_candidate.cpp",
@@ -214,6 +262,8 @@ def test_hot_sources_avoid_dynamic_allocation_primitives():
 
 
 def test_packaged_submission_jit_compiles_in_extracted_directory():
+    """Build the Kaggle source package and smoke-test in-place JIT compilation."""
+
     pytest.importorskip("pybind11")
     package_path = package_submission.build_package()
     env = os.environ.copy()
@@ -259,6 +309,8 @@ def test_packaged_submission_jit_compiles_in_extracted_directory():
 
 
 def test_kaggle_environment_smoke_when_available():
+    """Run a Kaggle environment smoke match when the package is installed."""
+
     kaggle_environments = pytest.importorskip("kaggle_environments")
     env = kaggle_environments.make("orbit_wars", configuration={"seed": 1}, debug=True)
     env.run(["main.py", "random"])

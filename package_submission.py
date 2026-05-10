@@ -1,16 +1,31 @@
-"""Create a Kaggle submission bundle with orbit_engine sources and pybind11 headers."""
+"""Create a Kaggle submission bundle with engine sources and pybind11 headers.
+
+The produced archive contains ``main.py``, all native C++ source/header files,
+and vendored pybind11 headers so Kaggle can JIT-compile the extension without a
+separate package installation step.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 import tarfile
 
+# Repository root used as the packaging base directory.
 ROOT = Path(__file__).resolve().parent
+
+# Default Kaggle submission archive path.
 OUT = ROOT / "submission.tar.gz"
 
 
 def _pybind11_include_dir() -> Path:
-    """Find installed pybind11 headers to vendor into the source bundle."""
+    """Find installed pybind11 headers to vendor into the source bundle.
+
+    Returns:
+        Path: Include directory containing ``pybind11/pybind11.h``.
+
+    Raises:
+        RuntimeError: If pybind11 is missing or does not expose headers.
+    """
 
     try:
         import pybind11
@@ -26,13 +41,23 @@ def _pybind11_include_dir() -> Path:
 
 
 def _add_file(tar: tarfile.TarFile, path: Path, arcname: Path) -> None:
-    """Add one file with a stable archive name and no recursive surprises."""
+    """Add one file with a stable archive name and no recursive surprises.
+
+    Args:
+        tar: Open tarfile handle.
+        path: Source file on disk.
+        arcname: Archive-relative destination path.
+    """
 
     tar.add(path, arcname=str(arcname), recursive=False)
 
 
 def build_package() -> Path:
-    """Create submission.tar.gz with main.py, engine sources, and pybind11."""
+    """Create ``submission.tar.gz`` with main.py, engine sources, and pybind11.
+
+    Returns:
+        Path: Path to the written archive.
+    """
 
     pybind_include = _pybind11_include_dir()
     with tarfile.open(OUT, "w:gz") as tar:
