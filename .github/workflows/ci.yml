@@ -71,27 +71,31 @@ jobs:
 
           obs = SimpleNamespace(
               player=0,
-              walls=[0] * 400,
-              crystals={},
-              robots={"f0": [0, 5, 2, 1000, 0, 0, 0, 0]},
-              mines={},
-              miningNodes={},
-              southBound=0,
-              northBound=19,
               step=0,
+              angular_velocity=0.0,
+              planets=[
+                  [0, 0, 10.0, 10.0, 2.0, 30, 2],
+                  [1, -1, 25.0, 10.0, 2.0, 5, 3],
+              ],
+              fleets=[],
+              initial_planets=[
+                  [0, 0, 10.0, 10.0, 2.0, 30, 2],
+                  [1, -1, 25.0, 10.0, 2.0, 5, 3],
+              ],
+              comets=[],
+              comet_planet_ids=[],
           )
-          config = SimpleNamespace(width=20, workerCost=200, wallRemoveCost=100)
-          actions = agent(obs, config)
-          assert isinstance(actions, dict)
-          assert "f0" in actions
+          actions = agent(obs)
+          assert isinstance(actions, list)
+          assert all(isinstance(row, list) and len(row) == 3 for row in actions)
           PY
 
       - name: Upload compiled extension artifact
         uses: actions/upload-artifact@v4
         with:
-          name: crawler-engine-ubuntu-py${{ matrix.python-version }}
+          name: orbit-engine-ubuntu-py${{ matrix.python-version }}
           path: |
-            build/crawler_engine*.so
+            build/orbit_engine*.so
             build/compile_commands.json
           if-no-files-found: error
           retention-days: 14
@@ -115,13 +119,13 @@ jobs:
             --exclude='dist' \
             --exclude='__pycache__' \
             --exclude='.pytest_cache' \
-            -czf dist/maze-crawler-ismcts-source.tar.gz .
+            -czf dist/orbit-wars-beam-search-source.tar.gz .
 
       - name: Upload source package
         uses: actions/upload-artifact@v4
         with:
-          name: maze-crawler-ismcts-source
-          path: dist/maze-crawler-ismcts-source.tar.gz
+          name: orbit-wars-beam-search-source
+          path: dist/orbit-wars-beam-search-source.tar.gz
           if-no-files-found: error
           retention-days: 30
 
