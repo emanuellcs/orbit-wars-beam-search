@@ -1,4 +1,9 @@
-"""Tiny local runner for Orbit Wars beam-search smoke experiments."""
+"""Local timing harness for Orbit Wars beam-search smoke experiments.
+
+The script builds deterministic synthetic observations and repeatedly calls the
+production ``agent`` entrypoint, giving quick latency and action-count feedback
+without running full Kaggle matches.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,15 @@ from main import agent
 
 
 def synthetic_obs(seed: int):
+    """Build a deterministic four-planet observation for a smoke run.
+
+    Args:
+        seed: Integer used to vary planet offsets and starting ships.
+
+    Returns:
+        dict: Observation with the same row shapes expected by ``main.agent``.
+    """
+
     offset = float(seed % 7)
     return {
         "player": 0,
@@ -34,6 +48,12 @@ def synthetic_obs(seed: int):
 
 
 def main() -> int:
+    """Run repeated synthetic observations and print aggregate latency metrics.
+
+    Returns:
+        int: Process exit status.
+    """
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, default=16)
     args = parser.parse_args()

@@ -20,6 +20,18 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 
 
 def agent(obs):
+    """Return nearest-planet capture moves for the baseline rules example.
+
+    Args:
+        obs: Dict-like or attribute-style Orbit Wars observation whose
+            ``planets`` field contains rows
+            ``[id, owner, x, y, radius, ships, production]``.
+
+    Returns:
+        list[list[int | float]]: Kaggle launch rows
+        ``[from_planet_id, angle_radians, ships]``.
+    """
+
     moves = []
     player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
     raw_planets = obs.get("planets", []) if isinstance(obs, dict) else obs.planets

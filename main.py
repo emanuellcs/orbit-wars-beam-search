@@ -1,4 +1,10 @@
-"""Kaggle entrypoint for the Orbit Wars C++ beam-search engine."""
+"""Kaggle entrypoint and JIT loader for the Orbit Wars C++ beam-search engine.
+
+The module keeps Kaggle-facing Python intentionally thin: it imports or builds
+the native ``orbit_engine`` extension, caches one engine per player id, converts
+observations through pybind11, and falls back to a simple Python policy only when
+native execution is unavailable.
+"""
 
 from __future__ import annotations
 
@@ -29,10 +35,18 @@ except NameError:
 
 
 def _jit_log(message):
+    """Write a native JIT diagnostic message to stderr immediately."""
+
     print(f"[orbit_engine jit] {message}", file=sys.stderr, flush=True)
 
 
 def _pybind11_include_dir():
+    """Return the pybind11 include directory available to the JIT compiler.
+
+    The packaged submission vendors headers under ``vendor/pybind11/include``;
+    local development can also use an installed ``pybind11`` package.
+    """
+
     candidates = [_ROOT / "vendor" / "pybind11" / "include"]
     try:
         import pybind11
@@ -47,6 +61,8 @@ def _pybind11_include_dir():
 
 
 def _python_include_dirs():
+    """Return existing Python development include directories for compilation."""
+
     paths = sysconfig.get_paths()
     include_dirs = []
     for key in ("include", "platinclude"):
@@ -57,6 +73,16 @@ def _python_include_dirs():
 
 
 def _compile_native_engine():
+    """Compile the native extension in place for Kaggle source submissions.
+
+    Returns:
+        bool: ``True`` when ``orbit_engine`` was built successfully.
+
+    Notes:
+        The command mirrors the CMake release flags and uses ``-pthread`` because
+        native search evaluates macro-actions with bounded worker threads.
+    """
+
     sources = sorted((_ROOT / "src").glob("*.cpp"))
     if not sources:
         _jit_log("no C++ sources found under src/")
@@ -114,6 +140,13 @@ def _compile_native_engine():
 
 
 def _ensure_native_engine():
+    """Ensure that the native ``orbit_engine`` module is importable.
+
+    Returns:
+        bool: ``True`` when the extension is already imported or was built and
+        imported successfully.
+    """
+
     global orbit_engine, _JIT_ATTEMPTED
     if orbit_engine is not None:
         return True
@@ -139,12 +172,27 @@ def _ensure_native_engine():
 
 
 def _get(obj, name, default=None):
+    """Read ``name`` from a dict-like or attribute-style observation object."""
+
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
 
 
 def _fallback_agent(obs):
+    """Return a conservative nearest-capture action list without native code.
+
+    Args:
+        obs: Dict-like or attribute-style Orbit Wars observation.
+
+    Returns:
+        list[list[int | float]]: Launch rows ``[from_planet_id, angle, ships]``.
+
+    Notes:
+        This policy exists for resilience only; it does not model moving targets,
+        swept collisions, or source reserves.
+    """
+
     player = int(_get(obs, "player", 0))
     planets = _get(obs, "planets", []) or []
     moves = []
@@ -171,6 +219,33 @@ def _fallback_agent(obs):
 
 
 def agent(obs, config=None):
+    """Choose Orbit Wars launch actions for one Kaggle turn.
+
+    Args:
+        obs: Dict-like or attribute-style observation with these expected fields:
+            ``player`` (int), ``step`` (int), ``angular_velocity`` (float),
+            ``remainingOverageTime`` (float, optional), ``planets`` as
+            ``list[[id:int, owner:int, x:float, y:float, radius:float,
+            ships:int, production:int]]``, ``fleets`` as
+            ``list[[id:int, owner:int, x:float, y:float, angle:float,
+            from_planet_id:int, ships:int]]``, ``initial_planets`` with the same
+            row shape as ``planets``, ``comet_planet_ids`` as ``list[int]``, and
+            ``comets`` as ``list[dict]`` containing ``planet_ids``, ``paths`` of
+            ``list[list[[x:float, y:float]]]``, and ``path_index``.
+        config: Unused Kaggle configuration object; accepted for environment
+            compatibility.
+
+    Returns:
+        list[list[int | float]]: Kaggle action rows
+        ``[[from_planet_id:int, angle_radians:float, ships:int], ...]``.
+
+    Notes:
+        Native state is cached per player id so repeated Kaggle calls avoid
+        reconstructing the pybind11 Engine object. The C++ layer clamps all
+        observation counts to fixed buffers before search.
+    """
+
+    del config
     _ensure_native_engine()
     if orbit_engine is None:
         return _fallback_agent(obs)

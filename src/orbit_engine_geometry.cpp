@@ -1,3 +1,11 @@
+/**
+ * @file orbit_engine_geometry.cpp
+ * @brief Geometry implementation for fleet motion, swept collisions, and intercepts.
+ *
+ * The search relies on analytic geometry instead of sampled headings. These
+ * routines compute continuous segment hits and bounded moving-target
+ * time-to-intercept values while remaining allocation-free on the hot path.
+ */
 #include "geometry.hpp"
 
 #include "orbit_engine_internal.hpp"
@@ -8,6 +16,15 @@
 namespace orbit {
 namespace {
 
+/**
+ * @brief Test whether an angle lies on a directed one-tick orbital sweep.
+ * @param start Starting angular position in radians.
+ * @param end Ending angular position in radians.
+ * @param value Candidate angle to test.
+ * @param velocity Signed angular velocity; its sign defines sweep direction.
+ * @return true when value is on the directed arc from start to end.
+ * @note Handles wrap-around by normalizing offsets into [0, 2*pi).
+ */
 bool angle_in_sweep(double start, double end, double value, double velocity) {
     start = detail::normalize_angle(start);
     end = detail::normalize_angle(end);
@@ -25,6 +42,16 @@ bool angle_in_sweep(double start, double end, double value, double velocity) {
     return offset <= span + 1.0e-7;
 }
 
+/**
+ * @brief Residual for the moving-target intercept equation.
+ * @param state Current game state.
+ * @param source_index Source planet SoA index.
+ * @param target_index Target planet SoA index.
+ * @param ships Packet size determining fleet speed.
+ * @param tau Candidate time-to-intercept in ticks.
+ * @return distance(source, target(tau)) - speed(ships) * tau.
+ * @note A root at zero means the fleet and target arrive at the same point.
+ */
 double intercept_residual(const GameState& state, int source_index, int target_index,
                           int ships, double tau) {
     const Vec2 source{state.planets.x[static_cast<size_t>(source_index)],
@@ -35,6 +62,13 @@ double intercept_residual(const GameState& state, int source_index, int target_i
 
 }  // namespace
 
+/**
+ * @brief Compute the Orbit Wars logarithmic fleet speed.
+ * @param ships Fleet size.
+ * @return Speed in board units per tick, clamped to [1, DEFAULT_SHIP_SPEED].
+ * @note The power curve makes packet size part of tactical timing: larger
+ *       launches travel faster, but speed saturates at the rule maximum.
+ */
 double speed_for_ships(int ships) {
     if (ships <= 1) {
         return 1.0;
@@ -45,6 +79,17 @@ double speed_for_ships(int ships) {
     return std::min(DEFAULT_SHIP_SPEED, std::max(1.0, speed));
 }
 
+/**
+ * @brief Intersect a segment against a circle using the quadratic equation.
+ * @param a Segment start point.
+ * @param b Segment end point.
+ * @param center Circle center.
+ * @param radius Circle radius.
+ * @param t_hit First hit fraction along the segment when an intersection exists.
+ * @return true when the closed segment starts inside or intersects the circle.
+ * @note Continuous collision is required because fleets can cross thin targets
+ *       between integer ticks.
+ */
 bool segment_circle_hit(Vec2 a, Vec2 b, Vec2 center, double radius, double& t_hit) {
     const Vec2 d{b.x - a.x, b.y - a.y};
     const Vec2 f{a.x - center.x, a.y - center.y};
@@ -62,6 +107,8 @@ bool segment_circle_hit(Vec2 a, Vec2 b, Vec2 center, double radius, double& t_hi
     if (disc < 0.0) {
         return false;
     }
+    // Earliest valid root wins because combat should occur at the first body hit
+    // on this tick, not at the endpoint.
     const double root = std::sqrt(std::max(0.0, disc));
     const double inv = 1.0 / (2.0 * aa);
     const double t0 = (-bb - root) * inv;
@@ -77,6 +124,15 @@ bool segment_circle_hit(Vec2 a, Vec2 b, Vec2 center, double radius, double& t_hi
     return false;
 }
 
+/**
+ * @brief Determine whether a segment exits the board during a tick.
+ * @param a Segment start point.
+ * @param b Segment end point.
+ * @param t_exit Approximate boundary crossing fraction.
+ * @return true when the segment endpoint is outside the board.
+ * @note Only endpoint-outside paths matter here because fleets already inside
+ *       the convex square cannot leave and re-enter within one straight segment.
+ */
 bool segment_exits_board(Vec2 a, Vec2 b, double& t_exit) {
     if (detail::inside_board(b)) {
         return false;
@@ -98,6 +154,16 @@ bool segment_exits_board(Vec2 a, Vec2 b, double& t_exit) {
     return true;
 }
 
+/**
+ * @brief Test a point against a circle swept along a straight segment.
+ * @param point Stationary point to test.
+ * @param a Segment start center of the moving body.
+ * @param b Segment end center of the moving body.
+ * @param radius Moving body radius.
+ * @return true when the closest point on the swept segment is within radius.
+ * @note This is used for comets sweeping stationary fleet positions after fleet
+ *       movement, matching the environment's continuous-body intent.
+ */
 bool swept_point_by_segment(Vec2 point, Vec2 a, Vec2 b, double radius) {
     const Vec2 d{b.x - a.x, b.y - a.y};
     const double len2 = d.x * d.x + d.y * d.y;
@@ -110,6 +176,17 @@ bool swept_point_by_segment(Vec2 point, Vec2 a, Vec2 b, double radius) {
     return detail::distance(point, closest) <= radius + 1.0e-9;
 }
 
+/**
+ * @brief Test a point against a circular body swept along an orbital arc.
+ * @param point Stationary point to test.
+ * @param old_center Body center before orbit motion.
+ * @param next_center Body center after orbit motion.
+ * @param orbit_radius Radius of the body's circular path.
+ * @param radius Body collision radius.
+ * @param angular_velocity Signed angular velocity for this body.
+ * @return true when the point falls in the swept angular interval and radial band.
+ * @note The radial-band check is the arc analogue of segment closest distance.
+ */
 bool swept_point_by_orbit_arc(Vec2 point, Vec2 old_center, Vec2 next_center,
                               double orbit_radius, double radius, double angular_velocity) {
     const Vec2 c{CENTER_X, CENTER_Y};
@@ -130,14 +207,40 @@ bool swept_point_by_orbit_arc(Vec2 point, Vec2 old_center, Vec2 next_center,
     return false;
 }
 
+/**
+ * @brief Compute an atan2 heading between two points.
+ * @param from Start point.
+ * @param to Target point.
+ * @return Heading angle in radians.
+ */
 double heading_to(Vec2 from, Vec2 to) {
     return std::atan2(to.y - from.y, to.x - from.x);
 }
 
+/**
+ * @brief Advance a point along a heading.
+ * @param origin Start point.
+ * @param angle Heading in radians.
+ * @param distance Distance in board units.
+ * @return Translated point.
+ */
 Vec2 point_on_heading(Vec2 origin, double angle, double distance) {
     return Vec2{origin.x + std::cos(angle) * distance, origin.y + std::sin(angle) * distance};
 }
 
+/**
+ * @brief Solve launch time and angle for a static, orbiting, or comet target.
+ * @param state Current game state.
+ * @param source_index Source planet SoA index.
+ * @param target_index Target planet SoA index.
+ * @param ships Packet size, which defines fleet speed.
+ * @param tau Output time-to-intercept in ticks.
+ * @param angle Output heading in radians.
+ * @return true when the target is reachable within the bounded horizon.
+ * @note Moving targets solve f(tau)=0 with secant proposals guarded by
+ *       bisection. The bisection fallback ensures convergence even when comet
+ *       interpolation or circular motion makes the residual non-linear.
+ */
 bool solve_intercept(const GameState& state, int source_index, int target_index,
                      int ships, double& tau, double& angle) {
     if (source_index < 0 || target_index < 0 || ships <= 0) {
@@ -157,6 +260,9 @@ bool solve_intercept(const GameState& state, int source_index, int target_index,
         tau = std::max(1.0, detail::distance(source, target) / speed);
         Vec2 spawn = source;
         double aim = heading_to(spawn, target);
+        // Launches spawn just outside the source radius, so aiming from the
+        // center would be slightly biased for close planets. Two refinement
+        // passes are enough because the spawn offset is tiny.
         for (int i = 0; i < 2; ++i) {
             spawn = point_on_heading(source, aim, state.planets.radius[static_cast<size_t>(source_index)] + 1.0e-3);
             aim = heading_to(spawn, target);
@@ -174,6 +280,9 @@ bool solve_intercept(const GameState& state, int source_index, int target_index,
     } else if (fhi > 0.0) {
         double best_tau = lo;
         double best_abs = std::abs(flo);
+        // If no sign change exists in the normal horizon, keep the best
+        // near-miss only when it is plausibly capturable. This avoids wasting
+        // macro slots on targets that fast comets have already outrun.
         for (int i = 2; i <= 120; ++i) {
             const double t = static_cast<double>(i);
             const double cur = std::abs(intercept_residual(state, source_index, target_index, ships, t));
@@ -219,6 +328,8 @@ bool solve_intercept(const GameState& state, int source_index, int target_index,
     const Vec2 target = state.planet_position_after(target_index, tau);
     double aim = heading_to(source, target);
     Vec2 spawn = source;
+    // Re-aim from the actual spawn point after tau is known. Three fixed passes
+    // keep the correction deterministic and cheaper than another root solve.
     for (int i = 0; i < 3; ++i) {
         spawn = point_on_heading(source, aim, state.planets.radius[static_cast<size_t>(source_index)] + 1.0e-3);
         aim = heading_to(spawn, target);

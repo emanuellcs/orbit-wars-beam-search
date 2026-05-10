@@ -1,3 +1,12 @@
+/**
+ * @file orbit_engine_state.cpp
+ * @brief Observation ingestion and fixed-buffer state reconstruction.
+ *
+ * This file converts a Python/Kaggle observation snapshot into the engine's SoA
+ * representation. It also reconstructs orbit metadata and attaches comet path
+ * indices so simulation and search can predict future positions without further
+ * Python interaction.
+ */
 #include "orbit_engine.hpp"
 
 #include "geometry.hpp"
@@ -9,6 +18,13 @@
 namespace orbit {
 namespace {
 
+/**
+ * @brief Find the initial observation row for a planet id.
+ * @param obs Fixed-buffer observation.
+ * @param planet_id Planet id to locate.
+ * @return Index in obs.initial_planets, or -1 when absent.
+ * @note O(initial_planet_count), bounded by MAX_PLANETS.
+ */
 int find_initial_planet(const ObservationInput& obs, int planet_id) {
     for (int i = 0; i < obs.initial_planet_count; ++i) {
         if (obs.initial_planets[static_cast<size_t>(i)].id == planet_id) {
@@ -18,6 +34,12 @@ int find_initial_planet(const ObservationInput& obs, int planet_id) {
     return -1;
 }
 
+/**
+ * @brief Copy observed comet paths into flattened native storage.
+ * @param state Mutable game state receiving comet path data.
+ * @param obs Fixed-buffer observation containing comet groups.
+ * @note Counts are clamped to fixed capacities to protect rollout buffers.
+ */
 void copy_comet_paths(GameState& state, const ObservationInput& obs) {
     state.comets.group_count = std::min(obs.comet_group_count, MAX_COMET_GROUPS);
     for (int g = 0; g < state.comets.group_count; ++g) {
@@ -40,6 +62,11 @@ void copy_comet_paths(GameState& state, const ObservationInput& obs) {
     }
 }
 
+/**
+ * @brief Mark planet SoA slots that correspond to active comet observations.
+ * @param state Mutable state with planets and comet path ids loaded.
+ * @note Comets override orbiting metadata because their path comes from samples.
+ */
 void attach_comet_metadata(GameState& state) {
     for (int g = 0; g < state.comets.group_count; ++g) {
         const int slots = state.comets.planet_count[static_cast<size_t>(g)];
@@ -61,6 +88,10 @@ void attach_comet_metadata(GameState& state) {
 
 }  // namespace
 
+/**
+ * @brief Reset the LaunchList to an empty logical buffer.
+ * @note Clearing rows prevents stale debug output while preserving fixed storage.
+ */
 void LaunchList::clear() {
     count = 0;
     for (Launch& launch : launches) {
@@ -68,6 +99,13 @@ void LaunchList::clear() {
     }
 }
 
+/**
+ * @brief Append one launch order when capacity and ship count are valid.
+ * @param from_planet_id Source planet id.
+ * @param angle Launch heading in radians.
+ * @param ships Positive ship count.
+ * @return true when appended, false when full or invalid.
+ */
 bool LaunchList::add(int from_planet_id, double angle, int ships) {
     if (count >= MAX_LAUNCHES || ships <= 0) {
         return false;
@@ -77,6 +115,10 @@ bool LaunchList::add(int from_planet_id, double angle, int ships) {
     return true;
 }
 
+/**
+ * @brief Clear all planet SoA fields to neutral defaults.
+ * @note Uses fill on fixed arrays so state reloads are deterministic.
+ */
 void PlanetSoA::clear() {
     count = 0;
     alive.fill(0);
@@ -96,6 +138,10 @@ void PlanetSoA::clear() {
     comet_slot.fill(-1);
 }
 
+/**
+ * @brief Clear all fleet SoA fields and reset generated ids.
+ * @note Tombstoned and unused slots become indistinguishable after reload.
+ */
 void FleetSoA::clear() {
     count = 0;
     next_id = 1;
@@ -110,6 +156,18 @@ void FleetSoA::clear() {
     speed.fill(0.0);
 }
 
+/**
+ * @brief Add a fleet into a tombstoned or fresh fixed-buffer slot.
+ * @param fleet_id Observation id, or negative to allocate a simulated id.
+ * @param fleet_owner Owner id.
+ * @param fleet_x X coordinate.
+ * @param fleet_y Y coordinate.
+ * @param fleet_angle Heading in radians.
+ * @param from_id Source planet id.
+ * @param fleet_ships Ships carried by the fleet.
+ * @return SoA slot index, or -1 if MAX_FLEETS is exhausted.
+ * @note The cached speed avoids recomputing the logarithmic curve every tick.
+ */
 int FleetSoA::add(int fleet_id, int fleet_owner, double fleet_x, double fleet_y,
                   double fleet_angle, int from_id, int fleet_ships) {
     int slot = -1;
@@ -138,12 +196,21 @@ int FleetSoA::add(int fleet_id, int fleet_owner, double fleet_x, double fleet_y,
     return slot;
 }
 
+/**
+ * @brief Mark a fleet slot dead without compacting the SoA arrays.
+ * @param index Fleet SoA slot to tombstone.
+ * @note O(1) removal preserves fixed indices during in-progress loops.
+ */
 void FleetSoA::remove(int index) {
     if (index >= 0 && index < count) {
         alive[static_cast<size_t>(index)] = 0;
     }
 }
 
+/**
+ * @brief Reset comet path metadata and sample storage.
+ * @note Path arrays are fixed-size because comet interpolation is used in search.
+ */
 void CometPathStore::clear() {
     group_count = 0;
     planet_count.fill(0);
@@ -154,18 +221,42 @@ void CometPathStore::clear() {
     path_y.fill(0.0);
 }
 
+/**
+ * @brief Flatten a comet group/slot pair.
+ * @param group Comet group index.
+ * @param slot Slot within the group.
+ * @return Flat per-comet index.
+ */
 int CometPathStore::slot_index(int group, int slot) const {
     return detail::comet_slot_flat(group, slot);
 }
 
+/**
+ * @brief Flatten a comet path sample coordinate.
+ * @param group Comet group index.
+ * @param slot Slot within the group.
+ * @param point Path point index.
+ * @return Flat path coordinate index.
+ */
 int CometPathStore::path_index_flat(int group, int slot, int point) const {
     return detail::comet_path_flat(group, slot, point);
 }
 
+/**
+ * @brief Clear queued combat arrivals.
+ * @note The queue is a dense planet-owner matrix to avoid associative storage.
+ */
 void CombatQueue::clear() {
     ships.fill(0);
 }
 
+/**
+ * @brief Accumulate arriving ships for one planet and owner.
+ * @param planet_index SoA planet index.
+ * @param owner Arriving owner id.
+ * @param ship_count Positive arriving ship count.
+ * @note Invalid coordinates are ignored so callers can stay branch-light.
+ */
 void CombatQueue::add(int planet_index, int owner, int ship_count) {
     if (planet_index < 0 || planet_index >= MAX_PLANETS || owner < 0 || owner >= MAX_PLAYERS || ship_count <= 0) {
         return;
@@ -173,6 +264,12 @@ void CombatQueue::add(int planet_index, int owner, int ship_count) {
     ships[static_cast<size_t>(planet_index * MAX_PLAYERS + owner)] += ship_count;
 }
 
+/**
+ * @brief Read accumulated arrivals for one planet and owner.
+ * @param planet_index SoA planet index.
+ * @param owner Owner id.
+ * @return Queued ship count, or zero for invalid coordinates.
+ */
 int CombatQueue::at(int planet_index, int owner) const {
     if (planet_index < 0 || planet_index >= MAX_PLANETS || owner < 0 || owner >= MAX_PLAYERS) {
         return 0;
@@ -180,6 +277,10 @@ int CombatQueue::at(int planet_index, int owner) const {
     return ships[static_cast<size_t>(planet_index * MAX_PLAYERS + owner)];
 }
 
+/**
+ * @brief Reset the entire game state to an empty non-terminal snapshot.
+ * @note Called before every observation load and by the engine constructor.
+ */
 void GameState::reset() {
     player = 0;
     step = 0;
@@ -192,6 +293,12 @@ void GameState::reset() {
     comets.clear();
 }
 
+/**
+ * @brief Load a Kaggle observation into native SoA buffers.
+ * @param obs Fixed-buffer observation created by the pybind11 bridge.
+ * @note Initial positions reconstruct orbit radius/phase; comet ids attach
+ *       sampled path metadata and disable circular orbit prediction.
+ */
 void GameState::load_from_observation(const ObservationInput& obs) {
     reset();
     player = obs.player;
@@ -238,6 +345,11 @@ void GameState::load_from_observation(const ObservationInput& obs) {
     }
 }
 
+/**
+ * @brief Find a live planet slot by environment id.
+ * @param planet_id Planet id to find.
+ * @return SoA slot index, or -1 when not present.
+ */
 int GameState::planet_index_by_id(int planet_id) const {
     for (int i = 0; i < planets.count; ++i) {
         if (planets.alive[static_cast<size_t>(i)] != 0 && planets.id[static_cast<size_t>(i)] == planet_id) {
@@ -247,6 +359,14 @@ int GameState::planet_index_by_id(int planet_id) const {
     return -1;
 }
 
+/**
+ * @brief Predict a planet center after a fractional number of ticks.
+ * @param planet_index Planet SoA slot.
+ * @param ticks Future offset in ticks.
+ * @return Predicted center or {0,0} for invalid/dead slots.
+ * @note Comets use linear interpolation between path samples; orbiting planets
+ *       use the current observed phase plus angular_velocity * ticks.
+ */
 Vec2 GameState::planet_position_after(int planet_index, double ticks) const {
     if (planet_index < 0 || planet_index >= planets.count ||
         planets.alive[static_cast<size_t>(planet_index)] == 0) {
@@ -274,6 +394,8 @@ Vec2 GameState::planet_position_after(int planet_index, double ticks) const {
         }
     }
     if (planets.is_orbiting[static_cast<size_t>(planet_index)] != 0) {
+        // Use the observed current phase rather than only initial_angle so
+        // mid-game observation reloads remain aligned with Kaggle state.
         const double phase = std::atan2(planets.y[static_cast<size_t>(planet_index)] - CENTER_Y,
                                         planets.x[static_cast<size_t>(planet_index)] - CENTER_X) +
                              planets.angular_velocity[static_cast<size_t>(planet_index)] * ticks;
@@ -284,6 +406,11 @@ Vec2 GameState::planet_position_after(int planet_index, double ticks) const {
                 planets.y[static_cast<size_t>(planet_index)]};
 }
 
+/**
+ * @brief Determine whether an owner still has any live planets or fleets.
+ * @param owner_value Owner id.
+ * @return true when the owner remains active in terminal checks.
+ */
 bool GameState::is_active_player(int owner_value) const {
     if (owner_value < 0 || owner_value >= MAX_PLAYERS) {
         return false;

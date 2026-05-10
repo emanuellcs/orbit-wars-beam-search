@@ -1,3 +1,11 @@
+/**
+ * @file orbit_engine_candidate.cpp
+ * @brief Tactical launch generation and legal macro-action packing.
+ *
+ * The search does not sample arbitrary headings. It first creates analytically
+ * solved launch packets, ranks them by tactical value, then packs legal
+ * multi-launch macro-actions with per-source spend accounting.
+ */
 #include "candidate.hpp"
 
 #include "eval.hpp"
@@ -10,6 +18,18 @@
 namespace orbit {
 namespace {
 
+/**
+ * @brief Build and insert one atomic launch packet when it is legal and reachable.
+ * @param state Current game state.
+ * @param player Controlled player id.
+ * @param source Source planet SoA index.
+ * @param target Target planet SoA index.
+ * @param ships Ships assigned to the packet.
+ * @param kind Tactical packet category.
+ * @param out Score-sorted atomic launch output.
+ * @note solve_intercept supplies tau and heading so search evaluates meaningful
+ *       geometry rather than wasting macro slots on sampled angles.
+ */
 void add_packet(const GameState& state, int player, int source, int target, int ships,
                 PacketKind kind, AtomicLaunchList& out) {
     if (ships <= 0 || source == target ||
@@ -42,11 +62,22 @@ void add_packet(const GameState& state, int player, int source, int target, int 
     launch.angle = angle;
     launch.eta = eta;
     launch.kind = kind;
+    // This prior prefers production and enemy/comet targets, then discounts
+    // slow arrivals and expensive launches. Rollout evaluation remains the
+    // final arbiter; the prior only controls the fixed candidate frontier.
     launch.score = owner_bonus + comet_bonus + prod * 24.0 + kind_bonus -
                    eta * 0.8 - static_cast<double>(ships) * 0.08;
     out.insert_sorted(launch);
 }
 
+/**
+ * @brief Try to add an atomic launch to a macro-action spend ledger.
+ * @param state Current game state.
+ * @param atom Atomic launch candidate.
+ * @param spend Per-source ships already committed by the macro-action.
+ * @return true when adding atom would not overspend its source.
+ * @note The spend array is indexed by SoA source slot, so no map lookup is needed.
+ */
 bool macro_legal_add(const GameState& state, const AtomicLaunch& atom,
                      std::array<int, MAX_PLANETS>& spend) {
     const int source = atom.source_index;
@@ -63,10 +94,19 @@ bool macro_legal_add(const GameState& state, const AtomicLaunch& atom,
 
 }  // namespace
 
+/**
+ * @brief Clear the logical atomic launch list.
+ */
 void AtomicLaunchList::clear() {
     count = 0;
 }
 
+/**
+ * @brief Insert an atomic launch into descending score order.
+ * @param launch Candidate packet to insert.
+ * @note Fixed-capacity insertion keeps the best MAX_ATOMIC_LAUNCHES packets and
+ *       silently drops lower-priority overflow.
+ */
 void AtomicLaunchList::insert_sorted(const AtomicLaunch& launch) {
     if (count <= 0) {
         items[0] = launch;
@@ -89,10 +129,18 @@ void AtomicLaunchList::insert_sorted(const AtomicLaunch& launch) {
     }
 }
 
+/**
+ * @brief Clear the logical macro-action list.
+ */
 void MacroActionList::clear() {
     count = 0;
 }
 
+/**
+ * @brief Insert a macro-action into descending score order.
+ * @param action Macro-action to insert.
+ * @note O(MAX_MACRO_ACTIONS) worst case but fixed and small relative to rollouts.
+ */
 void MacroActionList::insert_sorted(const MacroAction& action) {
     const int limit = std::min(count, MAX_MACRO_ACTIONS - 1);
     int pos = limit;
@@ -110,6 +158,15 @@ void MacroActionList::insert_sorted(const MacroAction& action) {
     }
 }
 
+/**
+ * @brief Compute a conservative reserve for one owned source planet.
+ * @param state Current game state.
+ * @param source_index Source planet SoA index.
+ * @param player Controlled player id.
+ * @return Ships to leave behind before all-safe launches.
+ * @note Enemy fleets are projected over a near-term segment to avoid stripping
+ *       a source that is already under direct threat.
+ */
 int defensive_reserve(const GameState& state, int source_index, int player) {
     int incoming = 0;
     const Vec2 source{state.planets.x[static_cast<size_t>(source_index)],
@@ -130,6 +187,14 @@ int defensive_reserve(const GameState& state, int source_index, int player) {
     return std::max(5, std::max(state.planets.production[static_cast<size_t>(source_index)] * 4, incoming + 1));
 }
 
+/**
+ * @brief Generate all ranked atomic launch candidates for one player.
+ * @param state Current game state.
+ * @param player Controlled player id.
+ * @param out Output atomic launch list.
+ * @note The packet basis is deliberately small: exact capture, over-capture,
+ *       harassment probes, and all-safe pressure from each owned source.
+ */
 void generate_atomic_launches(const GameState& state, int player, AtomicLaunchList& out) {
     out.clear();
     for (int source = 0; source < state.planets.count; ++source) {
@@ -161,6 +226,15 @@ void generate_atomic_launches(const GameState& state, int player, AtomicLaunchLi
     }
 }
 
+/**
+ * @brief Pack atomic packets into bounded, legal macro-actions.
+ * @param state Current game state.
+ * @param player Controlled player id.
+ * @param atoms Score-sorted atomic packet list.
+ * @param out Output macro-action list.
+ * @note Includes idle, single-packet actions, and greedy bundles while enforcing
+ *       source spend constraints for every bundle.
+ */
 void pack_macro_actions(const GameState& state, int player, const AtomicLaunchList& atoms,
                         MacroActionList& out) {
     out.clear();
@@ -203,6 +277,14 @@ void pack_macro_actions(const GameState& state, int player, const AtomicLaunchLi
     }
 }
 
+/**
+ * @brief Append deterministic launches for one owner.
+ * @param state Current game state.
+ * @param owner Owner id to act for.
+ * @param out Launch list to append into.
+ * @note Search uses this policy for opponents during rollouts so branch scores
+ *       are deterministic and reproducible across worker threads.
+ */
 void deterministic_launches_for_owner(const GameState& state, int owner, LaunchList& out) {
     AtomicLaunchList atoms{};
     MacroActionList macros{};
