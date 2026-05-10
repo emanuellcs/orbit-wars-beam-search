@@ -22,7 +22,10 @@ except Exception as exc:  # pragma: no cover
 
 _ENGINES = {}
 _JIT_ATTEMPTED = False
-_ROOT = Path(__file__).resolve().parent
+try:
+    _ROOT = Path(__file__).resolve().parent
+except NameError:
+    _ROOT = Path(os.getcwd()).resolve()
 
 
 def _jit_log(message):
