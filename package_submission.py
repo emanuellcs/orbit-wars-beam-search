@@ -1,4 +1,4 @@
-"""Create a Kaggle submission bundle with sources and pybind11 headers."""
+"""Create a Kaggle submission bundle with orbit_engine sources and pybind11 headers."""
 
 from __future__ import annotations
 
