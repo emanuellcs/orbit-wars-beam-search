@@ -657,7 +657,7 @@ kaggle competitions submit orbit-wars \
 
 ## CI/CD
 
-The GitHub Actions workflow builds and validates the project on Ubuntu for Python 3.11 and 3.12. The `build-test` matrix leg runs the full Pytest suite plus a 2-trial Optuna smoke that exercises all six required tuning flags (`--trials`, `--n-jobs`, `--seeds`, `--time-budget`, `--storage`, `--study-name`):
+The GitHub Actions workflow builds and validates the project on Ubuntu for Python 3.11 and 3.12:
 
 ```mermaid
 flowchart LR
@@ -668,8 +668,7 @@ flowchart LR
     Build --> Smoke["PYTHONPATH=build python test.py"]
     Smoke --> Pytest["python -m pytest -q test.py"]
     Pytest --> Import["Verify main.agent action format"]
-    Import --> Tune["Optuna smoke<br/>--trials 2 --n-jobs 2 --seeds 1<br/>--time-budget 120 --max-steps 10"]
-    Tune --> Artifact["Upload orbit_engine*.so<br/>and compile_commands.json"]
+    Import --> Artifact["Upload orbit_engine*.so<br/>and compile_commands.json"]
     Artifact --> Package["Create source package"]
     Package --> Release{"tag starts with v?"}
     Release -- yes --> Publish["Publish release artifact"]

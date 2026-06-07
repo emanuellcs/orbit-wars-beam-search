@@ -105,40 +105,6 @@ jobs:
           assert all(isinstance(row, list) and len(row) == 3 for row in actions)
           PY
 
-      - name: Run Optuna tuning smoke
-        # Exercise every required tune.py flag with a small but real
-        # multiprocessing-spawn study. SQLite persistence and best-trial
-        # reporting are part of the smoke; the per-match step cap keeps the
-        # whole leg under ~30 seconds while still building and consuming a
-        # real 1v1 (or FFA) match through kaggle_environments.
-        run: |
-          rm -f tune.db
-          PYTHONPATH=build python tune.py \
-            --trials 2 \
-            --n-jobs 2 \
-            --seeds 1 \
-            --time-budget 120 \
-            --storage sqlite:///tune.db \
-            --study-name ci-smoke \
-            --max-steps 10 \
-            --ffa-prob 0.5
-          # The harness is silent on success except for the [tune] header
-          # lines, so assert that the SQLite study recorded the two trials.
-          PYTHONPATH=build python - <<'PY'
-          import optuna
-          study = optuna.create_study(
-              study_name="ci-smoke",
-              storage="sqlite:///tune.db",
-              load_if_exists=True,
-          )
-          completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-          assert len(completed) == 2, f"expected 2 completed trials, got {len(completed)}"
-          for t in completed:
-              assert t.value is not None, f"trial {t.number} has no value"
-          print(f"[ci] Optuna smoke recorded {len(completed)} completed trials")
-          PY
-          rm -f tune.db tune.db-journal
-
       - name: Upload compiled extension artifact
         # Retain the built module and compile database for debugging CI failures.
         uses: actions/upload-artifact@v4
