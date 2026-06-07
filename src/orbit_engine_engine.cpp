@@ -11,6 +11,8 @@
 #include "eval.hpp"
 #include "search.hpp"
 
+#include <algorithm>
+
 namespace orbit {
 
 /**
@@ -45,13 +47,12 @@ void Engine::step_actions(const LaunchList& launches) {
 }
 
 /**
- * @brief Choose actions for the current state with default search settings.
+ * @brief Choose actions for the current state using the persisted config.
  * @param time_budget_ms Per-turn budget in milliseconds.
  * @param seed Deterministic seed for search branch mixing.
  * @return Selected launch list.
  */
 LaunchList Engine::choose_actions(int time_budget_ms, uint64_t seed) {
-    SearchConfig config{};
     return beam_search_action(sim.state, config, time_budget_ms, seed);
 }
 
@@ -62,7 +63,48 @@ LaunchList Engine::choose_actions(int time_budget_ms, uint64_t seed) {
  */
 double Engine::debug_evaluate(int player) const {
     const int eval_player = (player >= 0 && player < MAX_PLAYERS) ? player : sim.state.player;
-    return evaluate_state(sim.state, eval_player);
+    return evaluate_state(sim.state, eval_player, config.eval_weights);
+}
+
+/**
+ * @brief Clamp integer search limits to their inclusive valid ranges.
+ * @param cfg Configuration to clamp in place.
+ * @note Keeps the configuration object safe regardless of who set its fields.
+ */
+void clamp_search_config(SearchConfig& cfg) {
+    cfg.beam_width = std::min(std::max(1, cfg.beam_width), MAX_BEAM_WIDTH);
+    cfg.search_depth = std::min(std::max(1, cfg.search_depth), 10);
+    cfg.rollout_horizon = std::min(std::max(1, cfg.rollout_horizon), 96);
+    if (cfg.hard_stop_ms < 1) {
+        cfg.hard_stop_ms = 1;
+    } else if (cfg.hard_stop_ms > 900) {
+        cfg.hard_stop_ms = 900;
+    }
+}
+
+/**
+ * @brief Replace the persisted search configuration and clamp it.
+ * @param cfg New configuration; numeric limits are clamped to safe ranges.
+ */
+void Engine::set_search_config(const SearchConfig& cfg) {
+    config = cfg;
+    clamp_search_config(config);
+}
+
+/**
+ * @brief Update only the evaluator weights inside the persisted config.
+ * @param weights New evaluator coefficient bundle.
+ */
+void Engine::set_eval_weights(const EvalWeights& weights) {
+    config.eval_weights = weights;
+}
+
+/**
+ * @brief Update only the candidate weights inside the persisted config.
+ * @param weights New atomic-launch scoring coefficients.
+ */
+void Engine::set_candidate_weights(const CandidateWeights& weights) {
+    config.candidate_weights = weights;
 }
 
 }  // namespace orbit

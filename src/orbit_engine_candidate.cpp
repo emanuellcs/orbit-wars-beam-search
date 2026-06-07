@@ -26,12 +26,13 @@ namespace {
  * @param target Target planet SoA index.
  * @param ships Ships assigned to the packet.
  * @param kind Tactical packet category.
+ * @param weights Tunable scoring weights.
  * @param out Score-sorted atomic launch output.
  * @note solve_intercept supplies tau and heading so search evaluates meaningful
  *       geometry rather than wasting macro slots on sampled angles.
  */
 void add_packet(const GameState& state, int player, int source, int target, int ships,
-                PacketKind kind, AtomicLaunchList& out) {
+                PacketKind kind, const CandidateWeights& weights, AtomicLaunchList& out) {
     if (ships <= 0 || source == target ||
         state.planets.alive[static_cast<size_t>(source)] == 0 ||
         state.planets.alive[static_cast<size_t>(target)] == 0) {
@@ -48,12 +49,16 @@ void add_packet(const GameState& state, int player, int source, int target, int 
     }
     const int target_owner = state.planets.owner[static_cast<size_t>(target)];
     const double prod = static_cast<double>(state.planets.production[static_cast<size_t>(target)]);
-    const double owner_bonus = target_owner < 0 ? 18.0 : (target_owner == player ? -40.0 : 42.0);
-    const double comet_bonus = state.planets.is_comet[static_cast<size_t>(target)] != 0 ? 14.0 : 0.0;
+    const double owner_bonus = target_owner < 0
+                                  ? weights.owner_neutral
+                                  : (target_owner == player ? weights.owner_self : weights.owner_enemy);
+    const double comet_bonus = state.planets.is_comet[static_cast<size_t>(target)] != 0
+                                   ? weights.comet_bonus
+                                   : 0.0;
     const double kind_bonus =
-        kind == PacketKind::CaptureExact ? 10.0 :
-        kind == PacketKind::CaptureOver ? 16.0 :
-        kind == PacketKind::AllSafe ? 8.0 : 2.0;
+        kind == PacketKind::CaptureExact ? weights.kind_exact :
+        kind == PacketKind::CaptureOver ? weights.kind_over :
+        kind == PacketKind::AllSafe ? weights.kind_all_safe : weights.kind_harass;
     AtomicLaunch launch{};
     launch.from_planet_id = state.planets.id[static_cast<size_t>(source)];
     launch.source_index = source;
@@ -65,8 +70,8 @@ void add_packet(const GameState& state, int player, int source, int target, int 
     // This prior prefers production and enemy/comet targets, then discounts
     // slow arrivals and expensive launches. Rollout evaluation remains the
     // final arbiter; the prior only controls the fixed candidate frontier.
-    launch.score = owner_bonus + comet_bonus + prod * 24.0 + kind_bonus -
-                   eta * 0.8 - static_cast<double>(ships) * 0.08;
+    launch.score = owner_bonus + comet_bonus + prod * weights.prod_per_unit + kind_bonus -
+                   eta * weights.eta_discount - static_cast<double>(ships) * weights.ship_cost;
     out.insert_sorted(launch);
 }
 
@@ -191,11 +196,13 @@ int defensive_reserve(const GameState& state, int source_index, int player) {
  * @brief Generate all ranked atomic launch candidates for one player.
  * @param state Current game state.
  * @param player Controlled player id.
+ * @param weights Tunable scoring weights.
  * @param out Output atomic launch list.
  * @note The packet basis is deliberately small: exact capture, over-capture,
  *       harassment probes, and all-safe pressure from each owned source.
  */
-void generate_atomic_launches(const GameState& state, int player, AtomicLaunchList& out) {
+void generate_atomic_launches(const GameState& state, int player,
+                              const CandidateWeights& weights, AtomicLaunchList& out) {
     out.clear();
     for (int source = 0; source < state.planets.count; ++source) {
         if (state.planets.alive[static_cast<size_t>(source)] == 0 ||
@@ -212,16 +219,16 @@ void generate_atomic_launches(const GameState& state, int player, AtomicLaunchLi
             }
             const int garrison = state.planets.ships[static_cast<size_t>(target)];
             const int exact = garrison + 1;
-            add_packet(state, player, source, target, exact, PacketKind::CaptureExact, out);
+            add_packet(state, player, source, target, exact, PacketKind::CaptureExact, weights, out);
 
             const int slack = state.planets.production[static_cast<size_t>(target)] * 4 + 2;
-            add_packet(state, player, source, target, exact + slack, PacketKind::CaptureOver, out);
+            add_packet(state, player, source, target, exact + slack, PacketKind::CaptureOver, weights, out);
 
-            add_packet(state, player, source, target, 1, PacketKind::Harass, out);
-            add_packet(state, player, source, target, 3, PacketKind::Harass, out);
-            add_packet(state, player, source, target, 5, PacketKind::Harass, out);
-            add_packet(state, player, source, target, std::min(10, available / 4), PacketKind::Harass, out);
-            add_packet(state, player, source, target, all_safe, PacketKind::AllSafe, out);
+            add_packet(state, player, source, target, 1, PacketKind::Harass, weights, out);
+            add_packet(state, player, source, target, 3, PacketKind::Harass, weights, out);
+            add_packet(state, player, source, target, 5, PacketKind::Harass, weights, out);
+            add_packet(state, player, source, target, std::min(10, available / 4), PacketKind::Harass, weights, out);
+            add_packet(state, player, source, target, all_safe, PacketKind::AllSafe, weights, out);
         }
     }
 }
@@ -231,16 +238,20 @@ void generate_atomic_launches(const GameState& state, int player, AtomicLaunchLi
  * @param state Current game state.
  * @param player Controlled player id.
  * @param atoms Score-sorted atomic packet list.
+ * @param weights Tunable scoring weights.
+ * @param eval_weights Tunable evaluator weights used for the idle prior.
  * @param out Output macro-action list.
  * @note Includes idle, single-packet actions, and greedy bundles while enforcing
  *       source spend constraints for every bundle.
  */
 void pack_macro_actions(const GameState& state, int player, const AtomicLaunchList& atoms,
+                        const CandidateWeights& weights, const EvalWeights& eval_weights,
                         MacroActionList& out) {
+    (void)weights;  ///< per-launch scores are already baked into atoms.items[].score
     out.clear();
     MacroAction idle{};
     idle.launches.clear();
-    idle.score = evaluate_state(state, player) * 0.001;
+    idle.score = evaluate_state(state, player, eval_weights) * 0.001;
     out.insert_sorted(idle);
 
     const int single_limit = std::min(atoms.count, 128);
@@ -281,15 +292,17 @@ void pack_macro_actions(const GameState& state, int player, const AtomicLaunchLi
  * @brief Append deterministic launches for one owner.
  * @param state Current game state.
  * @param owner Owner id to act for.
+ * @param weights Tunable scoring weights.
  * @param out Launch list to append into.
  * @note Search uses this policy for opponents during rollouts so branch scores
  *       are deterministic and reproducible across worker threads.
  */
-void deterministic_launches_for_owner(const GameState& state, int owner, LaunchList& out) {
+void deterministic_launches_for_owner(const GameState& state, int owner,
+                                      const CandidateWeights& weights, LaunchList& out) {
     AtomicLaunchList atoms{};
     MacroActionList macros{};
-    generate_atomic_launches(state, owner, atoms);
-    pack_macro_actions(state, owner, atoms, macros);
+    generate_atomic_launches(state, owner, weights, atoms);
+    pack_macro_actions(state, owner, atoms, weights, EvalWeights{}, macros);
     if (macros.count <= 0) {
         return;
     }

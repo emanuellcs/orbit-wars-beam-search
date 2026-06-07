@@ -5,6 +5,10 @@
  * Search evaluates a bounded set of packed macro-actions with deterministic
  * rollouts. The parameters are clamped at runtime to keep CPU and memory usage
  * predictable inside Kaggle's per-turn deadline.
+ *
+ * @note ``SearchConfig`` itself is declared in ``orbit_engine.hpp`` so that
+ *       ``Engine`` can hold a value-typed member without a circular include.
+ *       This header owns the search entrypoint and the runtime thread cap.
  */
 #pragma once
 
@@ -12,17 +16,14 @@
 
 namespace orbit {
 
-/// @brief Tunable native search limits.
-struct SearchConfig {
-    ///< Maximum root macro-actions to evaluate.
-    int beam_width = 384;
-    ///< Deterministic tactical prefix depth after the root action.
-    int search_depth = 8;
-    ///< Additional rollout ticks after the tactical prefix.
-    int rollout_horizon = 64;
-    ///< Native hard deadline in milliseconds.
-    int hard_stop_ms = 900;
-};
+/// @brief Set the maximum number of search worker threads per process.
+/// @param n Requested thread count; clamped to [1, MAX_SEARCH_THREADS].
+/// @note Defaults to MAX_SEARCH_THREADS; tune.py forces this to 1 to avoid
+///       oversubscribing the host when n_jobs parallel trials are launched.
+void set_search_thread_limit(int n);
+/// @brief Return the currently configured search worker thread cap.
+/// @return Effective thread limit applied to beam_search_action.
+int search_thread_limit();
 
 /// @brief Select a launch list for the current state by evaluating macro-actions.
 /// @param state Current game state.

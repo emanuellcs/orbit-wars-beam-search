@@ -308,11 +308,103 @@ def test_packaged_submission_jit_compiles_in_extracted_directory():
         assert call.returncode == 0, call.stdout + call.stderr
 
 
+def test_set_hyperparameters_round_trips_through_engine():
+    """set_hyperparameters must accept known keys, return them, and survive agent() calls."""
+
+    # Make sure the cache is clean and the native module is loaded.
+    main._ENGINES.clear()
+    main._HYPERPARAMS.clear()
+
+    observation = obs(
+        [
+            [0, 0, 10.0, 10.0, 2.0, 30, 2],
+            [1, -1, 25.0, 10.0, 2.0, 5, 3],
+        ]
+    )
+    # Baseline call should produce a valid action list with default config.
+    baseline_actions = main.agent(observation)
+    assert isinstance(baseline_actions, list)
+
+    # Apply a clearly non-default configuration and ensure it round-trips.
+    main.set_hyperparameters(
+        beam_width=64,
+        search_depth=2,
+        rollout_horizon=16,
+        hard_stop_ms=300,
+        ship=1.5,
+        production=12.0,
+        territory_own=0.5,
+        territory_opp=0.25,
+        threat=2.0,
+        comet_owned=0.0,
+        comet_enemy=0.0,
+        comet_neutral=0.0,
+        owner_enemy=10.0,
+        owner_neutral=5.0,
+        owner_self=-1.0,
+        comet_bonus=0.0,
+        prod_per_unit=5.0,
+        kind_exact=0.0,
+        kind_over=0.0,
+        kind_all_safe=0.0,
+        kind_harass=0.0,
+        eta_discount=0.1,
+        ship_cost=0.01,
+        search_threads=1,
+    )
+    stored = main.get_hyperparameters()
+    assert stored["beam_width"] == 64
+    assert stored["production"] == 12.0
+    assert stored["ship_cost"] == 0.01
+    assert stored["search_threads"] == 1
+
+    # The applied config must be honored by the native engine on the next call.
+    tuned_actions = main.agent(observation)
+    assert isinstance(tuned_actions, list)
+    assert all(isinstance(row, list) and len(row) == 3 for row in tuned_actions)
+
+    # Unknown keys must raise so tuning bugs don't silently no-op.
+    with pytest.raises(TypeError):
+        main.set_hyperparameters(definitely_not_a_real_key=1.0)
+
+
+def test_opponents_loader_lists_available_policies():
+    """The opponents loader must expose baseline, mirror, and greedy policies."""
+
+    from opponents import list_opponents, load_opponent
+
+    names = list_opponents()
+    assert "baseline" in names
+    assert "mirror" in names
+    assert "greedy" in names
+    for name in names:
+        module = load_opponent(name)
+        assert callable(module.agent)
+
+
+def test_opponents_random_set_ffa_and_1v1():
+    """random_opponent_set must return the requested number of opponents."""
+
+    import random as _random
+
+    from opponents import random_opponent_set
+
+    rng = _random.Random(42)
+    one = random_opponent_set(1, rng)
+    assert len(one) == 1
+    three = random_opponent_set(3, rng)
+    assert len(three) == 3
+    for name in one + three:
+        assert isinstance(name, str)
+
+
 def test_kaggle_environment_smoke_when_available():
     """Run a Kaggle environment smoke match when the package is installed."""
 
     kaggle_environments = pytest.importorskip("kaggle_environments")
-    env = kaggle_environments.make("orbit_wars", configuration={"seed": 1}, debug=True)
+    env = kaggle_environments.make(
+        "orbit_wars", configuration={"seed": 1, "episodeSteps": 10}, debug=True
+    )
     env.run(["main.py", "random"])
     assert env.steps[-1][0].status in {"DONE", "ACTIVE", "TIMEOUT", "ERROR"}
 

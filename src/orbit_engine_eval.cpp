@@ -17,6 +17,18 @@
 namespace orbit {
 namespace {
 
+/// @brief Historical owned-comet value curve: ``18.0 + 0.35 * ships``.
+/// @details Factored out as a constant so the weight-aware evaluator keeps the
+///          same numerical answer at the default EvalWeights setting.
+constexpr double COMET_OWNED_BASE = 18.0;
+constexpr double COMET_OWNED_PER_SHIP = 0.35;
+/// @brief Historical enemy-comet penalty curve: ``12.0 + 0.2 * ships``.
+constexpr double COMET_ENEMY_BASE = 12.0;
+constexpr double COMET_ENEMY_PER_SHIP = 0.2;
+/// @brief Historical neutral-comet proximity curve: ``max(0, 10 - 0.1 * ships)``.
+constexpr double COMET_NEUTRAL_BASE = 10.0;
+constexpr double COMET_NEUTRAL_PER_SHIP = 0.1;
+
 /**
  * @brief Compute a production-weighted centrality bonus.
  * @param p Planet position.
@@ -64,17 +76,16 @@ double incoming_threat(const GameState& state, int player) {
     return threat;
 }
 
-}  // namespace
-
 /**
- * @brief Evaluate a state for a player.
+ * @brief Score a state using the provided weight bundle.
  * @param state Current or rolled-out game state.
- * @param player Player id, or negative to use state.player.
+ * @param player Player id to evaluate, or negative to use state.player.
+ * @param weights Tunable coefficient bundle.
  * @return Higher-is-better heuristic score.
- * @note The score blends ships, production, territory, incoming threat, and
- *       comet value to guide root macro-action selection.
+ * @note The math is identical to the historical formula at default weights so
+ *       existing behavior is preserved when no custom weights are injected.
  */
-double evaluate_state(const GameState& state, int player) {
+double evaluate_state_impl(const GameState& state, int player, const EvalWeights& weights) {
     const int eval_player = (player >= 0 && player < MAX_PLAYERS) ? player : state.player;
     double own_ships = 0.0;
     double opp_ships = 0.0;
@@ -94,19 +105,23 @@ double evaluate_state(const GameState& state, int player) {
         if (owner == eval_player) {
             own_ships += ships;
             own_prod += prod;
-            territory += centrality_value(pos, state.planets.production[static_cast<size_t>(p)]);
+            territory += weights.territory_own * centrality_value(pos, state.planets.production[static_cast<size_t>(p)]);
             if (state.planets.is_comet[static_cast<size_t>(p)] != 0) {
-                comet_value += 18.0 + ships * 0.35;
+                comet_value += weights.comet_owned *
+                               (COMET_OWNED_BASE + ships * COMET_OWNED_PER_SHIP);
             }
         } else if (owner >= 0) {
             opp_ships += ships;
             opp_prod += prod;
-            territory -= centrality_value(pos, state.planets.production[static_cast<size_t>(p)]) * 0.65;
+            territory -= weights.territory_opp *
+                         centrality_value(pos, state.planets.production[static_cast<size_t>(p)]);
             if (state.planets.is_comet[static_cast<size_t>(p)] != 0) {
-                comet_value -= 12.0 + ships * 0.2;
+                comet_value -= weights.comet_enemy *
+                               (COMET_ENEMY_BASE + ships * COMET_ENEMY_PER_SHIP);
             }
         } else if (state.planets.is_comet[static_cast<size_t>(p)] != 0) {
-            comet_value += std::max(0.0, 10.0 - ships * 0.1);
+            comet_value += weights.comet_neutral *
+                           std::max(0.0, COMET_NEUTRAL_BASE - ships * COMET_NEUTRAL_PER_SHIP);
         }
     }
 
@@ -121,11 +136,34 @@ double evaluate_state(const GameState& state, int player) {
         }
     }
 
-    return (own_ships - opp_ships) +
-           25.0 * (own_prod - opp_prod) +
+    return weights.ship * (own_ships - opp_ships) +
+           weights.production * (own_prod - opp_prod) +
            territory -
-           incoming_threat(state, eval_player) +
+           weights.threat * incoming_threat(state, eval_player) +
            comet_value;
+}
+
+}  // namespace
+
+/**
+ * @brief Convenience overload with default weights.
+ * @param state Current or rolled-out game state.
+ * @param player Player id to evaluate, or negative to use state.player.
+ * @return Heuristic score using EvalWeights{}.
+ */
+double evaluate_state(const GameState& state, int player) {
+    return evaluate_state_impl(state, player, EvalWeights{});
+}
+
+/**
+ * @brief Weight-aware evaluator entry point.
+ * @param state Current or rolled-out game state.
+ * @param player Player id to evaluate, or negative to use state.player.
+ * @param weights Tunable coefficient bundle.
+ * @return Heuristic score.
+ */
+double evaluate_state(const GameState& state, int player, const EvalWeights& weights) {
+    return evaluate_state_impl(state, player, weights);
 }
 
 }  // namespace orbit

@@ -17,6 +17,8 @@ The core breakthrough is not brute-force angle sampling. The engine shrinks the 
 - **Continuous physics simulator:** fleet segments are checked against the sun, board boundaries, planets, moving orbit arcs, and comet path sweeps instead of relying on endpoint approximations.
 - **Analytic interception:** static targets use direct headings; orbiting planets and comets solve a bounded time-of-arrival equation over $`\tau \in [1, 120]`$.
 - **Beam-style root evaluator:** the engine evaluates up to 384 packed macro-actions by default, rolls each forward through deterministic opponent policies, and selects the best state-evaluated branch within the 900 ms Kaggle action budget.
+- **Runtime hyperparameter injection:** `set_hyperparameters(kwargs)` retunes search depth, candidate prior weights, and evaluator weights through the pybind11 bridge in a single call; defaults reproduce the original hand-tuned values bit-for-bit.
+- **Optuna tuning harness:** `tune.py` runs a parallelized Bayesian-Optimization study over all 22 exposed hyperparameters, persists trials to SQLite, and matches the controlled agent against a directory of opponent policies.
 - **Kaggle-safe deployment:** `main.py` imports a prebuilt extension when available and can JIT-compile the extension inside the submission bundle using vendored pybind11 headers.
 
 ## Competition Overview
@@ -57,21 +59,22 @@ Combat groups all arriving fleets by owner. The largest arriving force fights th
 
 | Path | Role |
 | --- | --- |
-| `main.py` | Kaggle entrypoint, native import/JIT compilation, Python fallback agent |
+| `main.py` | Kaggle entrypoint, native import/JIT compilation, Python fallback agent, runtime hyperparameter injection |
 | `submission.py` | Local alias exporting `agent` from `main.py` |
-| `src/orbit_engine.hpp` | Public engine facade, fixed capacities, observations, SoA buffers |
+| `tune.py` | Optuna-based parallelized tuning harness with multiprocessing spawn workers and SQLite storage |
+| `opponents/` | Drop-in opponent policies (`baseline.py`, `greedy.py`, `mirror.py`) sampled by the tuning harness |
+| `src/orbit_engine.hpp` | Public engine facade, `EvalWeights`/`CandidateWeights`/`SearchConfig` structs, fixed capacities, SoA buffers |
 | `src/orbit_engine_state.cpp` | Observation ingestion, orbit/comet metadata, state reconstruction |
 | `src/orbit_engine_sim.cpp` | Turn-order simulator, launches, production, movement, combat, termination |
 | `src/orbit_engine_geometry.cpp` | Fleet speed, collision geometry, swept tests, interception solving |
-| `src/orbit_engine_candidate.cpp` | Atomic launch generation and legal macro-action packing |
-| `src/orbit_engine_search.cpp` | Root-parallel macro-action evaluation and deterministic rollouts |
-| `src/orbit_engine_eval.cpp` | Dense heuristic evaluator |
-| `src/orbit_engine_bindings.cpp` | pybind11 conversion layer and `Engine` Python API |
-| `test.py` | Regression tests for physics, parsing, search legality, packaging, and Kaggle smoke |
-| `tune.py` | Deterministic local timing/behavior harness for synthetic observations |
+| `src/orbit_engine_candidate.cpp` | Atomic launch generation, legal macro-action packing, weight-aware candidate scoring |
+| `src/orbit_engine_search.cpp` | Root-parallel macro-action evaluation, deterministic rollouts, runtime thread cap |
+| `src/orbit_engine_eval.cpp` | Dense heuristic evaluator with weight-aware term scaling |
+| `src/orbit_engine_bindings.cpp` | pybind11 conversion layer, `Engine` Python API, `set_hyperparameters(kwargs)` interface |
+| `test.py` | Regression tests for physics, parsing, search legality, packaging, Kaggle smoke, hyperparameters, opponents |
 | `package_submission.py` | Builds `submission.tar.gz` with sources and vendored pybind11 headers |
 | `CMakeLists.txt` | C++20 pybind11 build definition |
-| `.github/workflows/ci.yml` | Python 3.11/3.12 build, test, package, and release artifact workflow |
+| `.github/workflows/ci.yml` | Python 3.11/3.12 build, test, Optuna smoke, package, and release artifact workflow |
 | `rules/` | Local copy of Orbit Wars rules, getting-started material, and baseline example |
 
 ## System Architecture
@@ -81,6 +84,8 @@ The architecture is intentionally split between a tiny Python surface and a nati
 ```mermaid
 flowchart TB
     Kaggle["Kaggle runtime<br/>orbit_wars observation"] --> Main["main.py<br/>agent(obs, config=None)"]
+    Tune["tune.py / Optuna"] --> SetHP["set_hyperparameters(kwargs)"]
+    SetHP --> Cache
     Main --> Import{"orbit_engine importable?"}
     Import -- yes --> Cache["Per-player Engine cache<br/>_ENGINES[player]"]
     Import -- no --> JIT["JIT compile src/*.cpp<br/>pybind11 + Python headers<br/>g++ -std=c++20 -O3"]
@@ -96,6 +101,9 @@ flowchart TB
     Eval --> Actions["LaunchList"]
     Actions --> PythonList["Python action list<br/>[[planet, angle, ships], ...]"]
     Fallback --> PythonList
+    SetHP -. SearchConfig .-> Search
+    SetHP -. EvalWeights .-> Eval
+    SetHP -. CandidateWeights .-> Candidate
 ```
 
 ### Native State Model
@@ -106,10 +114,48 @@ The game state is structured for predictable memory access and fast copying duri
 classDiagram
     class Engine {
         +OrbitSim sim
+        +SearchConfig config
         +update_observation(obs)
         +step_actions(launches)
         +choose_actions(time_budget_ms, seed)
         +debug_evaluate(player)
+        +set_search_config(cfg)
+        +set_eval_weights(weights)
+        +set_candidate_weights(weights)
+    }
+
+    class SearchConfig {
+        +int beam_width
+        +int search_depth
+        +int rollout_horizon
+        +int hard_stop_ms
+        +EvalWeights eval_weights
+        +CandidateWeights candidate_weights
+    }
+
+    class EvalWeights {
+        +double ship
+        +double production
+        +double territory_own
+        +double territory_opp
+        +double threat
+        +double comet_owned
+        +double comet_enemy
+        +double comet_neutral
+    }
+
+    class CandidateWeights {
+        +double owner_enemy
+        +double owner_neutral
+        +double owner_self
+        +double comet_bonus
+        +double prod_per_unit
+        +double kind_exact
+        +double kind_over
+        +double kind_all_safe
+        +double kind_harass
+        +double eta_discount
+        +double ship_cost
     }
 
     class OrbitSim {
@@ -165,6 +211,9 @@ classDiagram
     }
 
     Engine --> OrbitSim
+    Engine --> SearchConfig
+    SearchConfig --> EvalWeights
+    SearchConfig --> CandidateWeights
     OrbitSim --> GameState
     GameState --> PlanetSoA
     GameState --> FleetSoA
@@ -190,12 +239,13 @@ The regression suite explicitly checks the hot source files for dynamic-allocati
 
 ### Python to C++ Bridge
 
-The binding layer accepts both dictionary-style Kaggle observations and attribute-style namespace observations. It converts Python lists into `ObservationInput`, clamps counts to fixed capacities, reconstructs initial planet metadata, and exposes a small API for tests and local experimentation.
+The binding layer accepts both dictionary-style Kaggle observations and attribute-style namespace observations. It converts Python lists into `ObservationInput`, clamps counts to fixed capacities, reconstructs initial planet metadata, and exposes a small API for tests and local experimentation. The `set_hyperparameters(kwargs)` route is the inverse: a `py::kwargs` dict is parsed into the native `SearchConfig` (with `EvalWeights` and `CandidateWeights` nested structs) and the engine is reseated in one call.
 
 ```mermaid
 sequenceDiagram
     participant K as Kaggle
     participant P as main.py
+    participant T as tune.py
     participant B as pybind11
     participant E as orbit::Engine
     participant S as Search
@@ -211,25 +261,30 @@ sequenceDiagram
     E->>B: native launch buffer
     B->>P: Python list
     P->>K: [[from_planet_id, angle, ships], ...]
+
+    T->>P: set_hyperparameters(kwargs)
+    P->>B: engine.set_hyperparameters(kwargs)
+    B->>E: SearchConfig with EvalWeights + CandidateWeights
+    E->>S: next choose_actions uses new config
 ```
 
 ### Search Loop
 
-The search loop is built around a legal action frontier. It first generates candidate launch packets from owned planets to every non-owned live target, sorts them by tactical value, packs high-scoring combinations without overspending a source planet, then evaluates the resulting macro-actions in parallel.
+The search loop is built around a legal action frontier. It first generates candidate launch packets from owned planets to every non-owned live target, sorts them by tactical value, packs high-scoring combinations without overspending a source planet, then evaluates the resulting macro-actions in parallel. The candidate prior and the dense rollout heuristic consume the same `SearchConfig` so a single `set_hyperparameters(kwargs)` call from Python retunes both the frontier ranking and the rollout scoring in one shot.
 
 ```mermaid
 flowchart TD
     Root["Current GameState"] --> Atoms["generate_atomic_launches<br/>capture_exact, capture_over,<br/>harass, all_safe"]
     Atoms --> Intercepts["solve_intercept<br/>static direct aim<br/>orbit/comet root solve"]
-    Intercepts --> AtomRank["AtomicLaunchList<br/>score-sorted bounded insert"]
+    Intercepts --> AtomRank["AtomicLaunchList<br/>CandidateWeights-scored<br/>bounded insert"]
     AtomRank --> MacroPack["pack_macro_actions<br/>idle + singles + greedy bundles"]
     MacroPack --> Fallback["Legal fallback<br/>best 1-ply macro-action"]
-    MacroPack --> Workers["Parallel workers<br/>atomic cursor across candidates"]
+    MacroPack --> Workers["Parallel workers<br/>atomic cursor across candidates<br/>thread cap from g_search_thread_limit"]
 
     Workers --> FirstStep["Apply my macro-action<br/>plus deterministic opponents"]
-    FirstStep --> Prefix["Depth-8 deterministic prefix"]
-    Prefix --> Rollout["64-tick deterministic rollout"]
-    Rollout --> Heuristic["evaluate_state"]
+    FirstStep --> Prefix["Depth-N deterministic prefix<br/>N = config.search_depth"]
+    Prefix --> Rollout["K-tick deterministic rollout<br/>K = config.rollout_horizon"]
+    Rollout --> Heuristic["evaluate_state<br/>weighted by EvalWeights"]
     Heuristic --> Best{"Best score before deadline?"}
     Best -- yes --> Selected["Return selected LaunchList"]
     Best -- no --> Fallback
@@ -334,13 +389,13 @@ Atomic packet priority is computed as:
 A =
 B_{\text{owner}}
 + B_{\text{comet}}
-+ 24P_t
++ c_{\text{prod}} P_t
 + B_{\text{kind}}
-- 0.8\eta
-- 0.08n
+- c_{\text{eta}}\eta
+- c_{\text{ship}} n
 ```
 
-where $`P_t`$ is target production, $`\eta`$ is estimated time of arrival, and $`n`$ is ships launched. The sorted atomic list is then greedily packed into legal macro-actions with per-source spend accounting:
+where $`P_t`$ is target production, $`\eta`$ is estimated time of arrival, and $`n`$ is ships launched. The bonus and penalty coefficients $`B_{\text{owner}}`$, $`B_{\text{comet}}`$, $`B_{\text{kind}}`$, $`c_{\text{prod}}`$, $`c_{\text{eta}}`$, and $`c_{\text{ship}}`$ are the live values from the engine's `CandidateWeights` struct (default $`24.0`$, $`0.8`$, and $`0.08`$ for the latter three). The sorted atomic list is then greedily packed into legal macro-actions with per-source spend accounting:
 
 ```math
 \sum_{a \in M_s} n_a \le G_s
@@ -352,15 +407,18 @@ where $`G_s`$ is the current source garrison.
 
 Each candidate macro-action is evaluated by cloning the current `GameState`, applying the candidate for the controlled player, filling opponent actions with the same deterministic geometric policy, and rolling the state forward.
 
-The evaluator balances material, production, board position, threat, and comet opportunities:
+The evaluator balances material, production, board position, threat, and comet opportunities, with each term scaled by a tunable coefficient from the engine's `EvalWeights` struct:
 
 ```math
 E(s,p) =
-(S_p - S_{\neg p})
-+ 25(P_p - P_{\neg p})
-+ T_p
-- H_p
-+ C_p
+w_{\text{ship}}(S_p - S_{\neg p})
++ w_{\text{production}}(P_p - P_{\neg p})
++ w_{\text{territory\_own}}\,T_p
+- w_{\text{territory\_opp}}\,T_{\neg p}
+- w_{\text{threat}}\,H_p
++ w_{\text{comet\_owned}}\,C_p^{\text{own}}
++ w_{\text{comet\_enemy}}\,C_p^{\text{enemy}}
++ w_{\text{comet\_neutral}}\,C_p^{\text{neutral}}
 ```
 
 The terms are:
@@ -369,7 +427,9 @@ The terms are:
 - $`P`$: owned production.
 - $`T`$: centrality-weighted territorial value.
 - $`H`$: incoming fleet threat against owned planets.
-- $`C`$: comet ownership and capture opportunity value.
+- $`C^{\text{own}}`$, $`C^{\text{enemy}}`$, $`C^{\text{neutral}}`$: owned, enemy, and neutral comet value contributions.
+
+Defaults reproduce the prior hand-tuned coefficients (1.0, 25.0, 1.0, 0.65, 1.0 for the first five) so behavior is bit-for-bit identical when no custom weights are injected.
 
 The selected action is:
 
@@ -398,7 +458,9 @@ The simulator trusts `initial_planets`, `angular_velocity`, `comets`, and `comet
 
 ## Optimization and Tuning Pipeline
 
-The primary search constants live in `src/search.hpp`:
+The tuning surface exposed to Python spans four search limits, eight heuristic weights, and eleven atomic-launch prior weights — 22 hyperparameters in total. All are reachable through `set_hyperparameters(**kwargs)` on the pybind11 `Engine` and on `main.set_hyperparameters(**kwargs)`. Defaults reproduce the prior hand-tuned values bit-for-bit, so the engine is identical to the Grandmaster baseline until a caller opts in to retuning.
+
+### Search limits (`src/search.hpp`, `SearchConfig` integer fields)
 
 | Parameter | Default | Clamp in search | Meaning |
 | --- | ---: | ---: | --- |
@@ -407,29 +469,91 @@ The primary search constants live in `src/search.hpp`:
 | `rollout_horizon` | 64 | `1..96` | Additional deterministic rollout ticks |
 | `hard_stop_ms` | 900 | budget cap | Maximum native search time per action |
 
-The checked-in `tune.py` is a deterministic smoke and latency harness rather than a full persisted Optuna study. It synthesizes small Orbit Wars observations, calls `main.agent`, and reports:
+### Heuristic evaluator weights (`EvalWeights`)
 
-```text
-runs=<N>
-mean_ms=<average action latency>
-max_ms=<worst action latency>
-mean_actions=<average launch count>
-```
+| Parameter | Default | Term in the rollout score |
+| --- | ---: | --- |
+| `ship` | 1.0 | Material advantage $`(S_p - S_{\neg p})`$ |
+| `production` | 25.0 | Production advantage $`(P_p - P_{\neg p})`$ |
+| `territory_own` | 1.0 | Centrality bonus on owned planets |
+| `territory_opp` | 0.65 | Centrality penalty on opponent planets |
+| `threat` | 1.0 | Incoming fleet threat penalty |
+| `comet_owned` | 1.0 | Owned comet value (base 18.0 + 0.35 per ship) |
+| `comet_enemy` | 1.0 | Enemy comet value penalty (base 12.0 + 0.2 per ship) |
+| `comet_neutral` | 1.0 | Neutral comet proximity value (max 0, 10 - 0.1 per ship) |
+
+### Atomic-launch prior weights (`CandidateWeights`)
+
+| Parameter | Default | Effect on candidate ranking |
+| --- | ---: | --- |
+| `owner_enemy` | 42.0 | Bonus for opponent-owned targets |
+| `owner_neutral` | 18.0 | Bonus for neutral targets |
+| `owner_self` | -40.0 | Penalty for already-owned targets |
+| `comet_bonus` | 14.0 | Flat bonus when the target is a comet |
+| `prod_per_unit` | 24.0 | Per-production score contribution |
+| `kind_exact` | 10.0 | Tactical prior for `CaptureExact` packets |
+| `kind_over` | 16.0 | Tactical prior for `CaptureOver` packets |
+| `kind_all_safe` | 8.0 | Tactical prior for `AllSafe` packets |
+| `kind_harass` | 2.0 | Tactical prior for `Harass` packets |
+| `eta_discount` | 0.8 | Penalty per tick of expected arrival time |
+| `ship_cost` | 0.08 | Penalty per ship committed to the launch |
+
+### Runtime thread cap
+
+The native search uses a bounded worker pool with a process-wide cap of `MAX_SEARCH_THREADS=20` (see `src/orbit_engine.hpp`). `tune.py` calls `orbit_engine.set_search_thread_limit(1)` at module import time and per trial, so the C++ search never spawns more than one worker thread per process. With `--n-jobs=16` parallel trials on a 20-core host, total active search threads stay at 16, leaving 4 cores for the OS scheduler. The `search_threads` keyword is a process-level setting rather than a `SearchConfig` field, so it never appears in the Optuna search space.
+
+### Opponent directory
+
+The `opponents/` package holds drop-in Python policies for the tuning harness:
+
+- `opponents/baseline.py` — nearest-target policy with a `4 * production` reserve (the prior `opponent.py`).
+- `opponents/greedy.py` — same nearest-target policy with a `3 * production` reserve (more aggressive launches).
+- `opponents/mirror.py` — mirrored-coordinate policy: targets the planet at the source's symmetric position around the board's center, falling back to nearest non-self target.
+- The string sentinel `"random"` is also accepted, mapping to Kaggle's built-in random agent.
+
+`opponents/__init__.py` exposes `list_opponents`, `load_opponent`, `make_callable`, `random_opponent_set`, and `resolve_agent_list` for the tuning harness.
+
+### Optuna harness
+
+`tune.py` wraps the native engine in a multiprocessing-spawn Optuna study:
+
+- Required CLI flags: `--trials`, `--n-jobs`, `--seeds`, `--time-budget`, `--storage`, `--study-name`.
+- Optional flags: `--max-steps`, `--ffa-prob`, `--timeout`, `--seed-offset`.
+- Objective: composite `100*win + 20*draw + 1*ship_margin + 0.5*score_z` (win-rate-dominated).
+- TPE sampler with `multivariate=True, group=True` so correlated hyperparameters explore jointly.
+- Per trial: sample hyperparameters, call `main.set_hyperparameters(search_threads=1, **hp)`, play `--seeds` matches (1v1 or 4-player FFA by `--ffa-prob` coin flip) against an opponent sampled from `opponents/`, aggregate metrics, and prune on wall-clock budget exhaustion.
+- The whole trial body is wrapped in `try/except` so any single crash returns `-1e6` and the study survives; per-match crashes are logged and skipped, not trial-fatal.
 
 Run it after building the extension:
 
 ```bash
-PYTHONPATH=build python tune.py --seeds 64
+PYTHONPATH=build python tune.py \
+  --trials 1000 \
+  --n-jobs 16 \
+  --seeds 5 \
+  --time-budget 300 \
+  --storage sqlite:///tune.db \
+  --study-name orbit-vs-opponent
 ```
 
-`requirements-dev.txt` includes `optuna>=3.6`, so the repository is dependency-ready for a SQLite-backed study, but no committed file currently calls `optuna.create_study` or opens a SQLite storage URL. A production tuning loop for this codebase should optimize the four constants above plus candidate-prior weights from `orbit_engine_candidate.cpp` and evaluator weights from `orbit_engine_eval.cpp`, using local `kaggle_environments` matches and the existing deterministic smoke harness as the latency guardrail.
+A minimal smoke run that completes in under a minute:
 
-Recommended objective components:
+```bash
+PYTHONPATH=build python tune.py \
+  --trials 2 --n-jobs 2 --seeds 1 \
+  --max-steps 10 --time-budget 60 \
+  --storage sqlite:///tune.db \
+  --study-name smoke-test
+```
 
-- Win rate or mean reward over a fixed seed suite.
-- Mean and p95 action latency under the 900 ms budget.
+A study can be resumed by pointing `--storage` at the same SQLite URL and `--study-name` at the same identifier (`optuna.create_study(..., load_if_exists=True)`).
+
+### Recommended objective components
+
+- Win rate or mean reward over the `--seeds` matches per trial.
+- Mean and p95 action latency under the 900 ms Kaggle budget (not currently part of the composite but easy to add as a constraint).
 - Illegal-action rate, which should remain zero because macro packing and simulator launch processing enforce source spend constraints.
-- Robustness against `random`, `opponent.py`, and previous frozen submissions.
+- Robustness against the mixed opponent directory (baseline, greedy, mirror, plus the `random` sentinel) to avoid overfitting to a single play style.
 
 ## Build and Execution
 
@@ -468,6 +592,9 @@ The test suite covers:
 - Search action format and macro-packer spend safety.
 - Hot-path source allocation checks.
 - Packaged submission JIT compilation.
+- `main.agent(obs)` returns an `[[planet, angle, ships], ...]` action list.
+- `set_hyperparameters(**kwargs)` round-trips into the C++ `SearchConfig` and back.
+- Opponents loader enumerates `opponents/`, `random_opponent_set` produces 1v1 and FFA sets.
 - Kaggle environment smoke execution when `kaggle_environments` is installed.
 
 ### 4. Run the Kaggle Entrypoint Smoke
@@ -484,13 +611,19 @@ orbit_engine native available: True
 
 Without `PYTHONPATH=build`, `main.py` attempts to JIT-compile `orbit_engine` in place from `src/*.cpp` using installed or vendored pybind11 headers.
 
-### 5. Run Local Timing Experiments
+### 5. Run the Optuna Tuning Harness
+
+The full production command (1000 trials × 5 seeds × parallel workers) lives under [Optimization and Tuning Pipeline](#optimization-and-tuning-pipeline). For local validation, run a 2-trial smoke study against the opponent directory with a reduced per-match step cap:
 
 ```bash
-PYTHONPATH=build python tune.py --seeds 128
+PYTHONPATH=build python tune.py \
+  --trials 2 --n-jobs 2 --seeds 1 \
+  --max-steps 10 --time-budget 60 \
+  --storage sqlite:///tune.db \
+  --study-name smoke-test
 ```
 
-This exercises `agent(obs)` repeatedly on deterministic synthetic positions and reports timing/action-count metrics.
+The harness forces `set_search_thread_limit(1)` on every trial, so the C++ search never spawns more than one worker thread per process even when `--n-jobs` is greater than one. The SQLite database and study name are reused if rerun, so interrupted studies are resumable.
 
 ### 6. Build the Kaggle Submission Bundle
 
@@ -524,7 +657,7 @@ kaggle competitions submit orbit-wars \
 
 ## CI/CD
 
-The GitHub Actions workflow builds and validates the project on Ubuntu for Python 3.11 and 3.12:
+The GitHub Actions workflow builds and validates the project on Ubuntu for Python 3.11 and 3.12. The `build-test` matrix leg runs the full Pytest suite plus a 2-trial Optuna smoke that exercises all six required tuning flags (`--trials`, `--n-jobs`, `--seeds`, `--time-budget`, `--storage`, `--study-name`):
 
 ```mermaid
 flowchart LR
@@ -535,7 +668,8 @@ flowchart LR
     Build --> Smoke["PYTHONPATH=build python test.py"]
     Smoke --> Pytest["python -m pytest -q test.py"]
     Pytest --> Import["Verify main.agent action format"]
-    Import --> Artifact["Upload orbit_engine*.so<br/>and compile_commands.json"]
+    Import --> Tune["Optuna smoke<br/>--trials 2 --n-jobs 2 --seeds 1<br/>--time-budget 120 --max-steps 10"]
+    Tune --> Artifact["Upload orbit_engine*.so<br/>and compile_commands.json"]
     Artifact --> Package["Create source package"]
     Package --> Release{"tag starts with v?"}
     Release -- yes --> Publish["Publish release artifact"]
@@ -549,7 +683,8 @@ The workflow also creates a source archive that excludes `.git`, `.github`, `bui
 - The engine is deliberately **not** a bitboard implementation. Orbit Wars is continuous and moving-target heavy, so the performance-critical representation is fixed-buffer SoA plus geometric prediction.
 - Search uses deterministic opponent policies during rollouts. This improves repeatability and avoids spending the action budget on stochastic policy sampling.
 - Future comet spawns are not predicted internally until the Kaggle observation exposes them. Active comet paths are modeled from the observation's `comets` field.
-- `SearchConfig` is currently native-only and constructed with defaults inside `Engine::choose_actions`; exposing it through pybind11 would be the natural next step for full automated parameter tuning.
+- `SearchConfig`, `EvalWeights`, and `CandidateWeights` are exposed through pybind11 as `set_hyperparameters(**kwargs)` on the `Engine` and re-exported by `main.set_hyperparameters`. Missing keys keep their current values, so the call is additive and safe to invoke repeatedly during a tuning run.
+- `set_search_thread_limit(n)` is a separate process-level handle (not part of `SearchConfig`) so the Optuna harness can cap C++ worker spawning per process without poisoning the cross-process shared config.
 - The Python fallback is intentionally simple. It exists for resilience when a native build fails, not as the competitive policy.
 
 ## License

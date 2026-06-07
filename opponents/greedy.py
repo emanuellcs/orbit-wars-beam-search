@@ -1,7 +1,10 @@
-"""Simple Orbit Wars benchmark opponent used for local smoke matches.
+"""Aggressive greedy Orbit Wars opponent.
 
-The policy is intentionally deterministic and lightweight: each owned planet
-attacks the nearest non-owned target only when it can preserve a small reserve.
+Same nearest-target heuristic as ``baseline`` but commits ships at one third
+of the production-based reserve. This produces relentless pressure without
+caring about counter-attacks, which is the policy our tuned agent must learn
+to repel. Because it overruns itself late-game, a tuned agent can usually
+outlast it through better pacing.
 """
 
 from __future__ import annotations
@@ -17,8 +20,11 @@ def _get(obj, name, default=None):
     return getattr(obj, name, default)
 
 
+_RESERVE_DIVISOR = 3  # baseline uses *4; this policy keeps a much thinner reserve
+
+
 def agent(obs, config=None):
-    """Return nearest-target launch actions for a local benchmark opponent.
+    """Return greedy nearest-target launch actions with a thin defensive reserve.
 
     Args:
         obs: Dict-like or attribute-style Orbit Wars observation.
@@ -42,7 +48,7 @@ def agent(obs, config=None):
             key=lambda p: math.hypot(float(p[2]) - float(mine[2]), float(p[3]) - float(mine[3])),
         )
         ships = int(target[5]) + 1
-        reserve = max(5, int(mine[6]) * 4)
+        reserve = max(2, int(mine[6]) * _RESERVE_DIVISOR)
         if int(mine[5]) - reserve >= ships:
             moves.append(
                 [
@@ -55,15 +61,7 @@ def agent(obs, config=None):
 
 
 def act(obs, config=None):
-    """Safe wrapper matching alternative local runner conventions.
-
-    Args:
-        obs: Dict-like or attribute-style Orbit Wars observation.
-        config: Optional Kaggle configuration object.
-
-    Returns:
-        list: Launch rows, or an empty list if the opponent raises.
-    """
+    """Safe wrapper matching alternative local runner conventions."""
 
     try:
         return agent(obs, config)
