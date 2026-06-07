@@ -21,6 +21,12 @@
 namespace orbit {
 namespace {
 
+/// @brief Per-process worker thread cap, defaults to MAX_SEARCH_THREADS.
+/// @details tune.py forces this to 1 to keep ``n_jobs`` Optuna trials from
+///          oversubscribing the host machine. The Kaggle runtime never calls
+///          the setter and therefore keeps the full native thread pool.
+std::atomic<int> g_search_thread_limit{MAX_SEARCH_THREADS};
+
 /**
  * @brief Append one launch list into another.
  * @param dst Destination launch list.
@@ -39,14 +45,16 @@ void append_launches(LaunchList& dst, const LaunchList& src) {
  * @param state Current game state.
  * @param joint Joint launch list to append into.
  * @param skip_owner Owner id whose actions are already supplied.
+ * @param weights Tunable scoring weights for the deterministic policy.
  * @note Used to make the root candidate face plausible opponent pressure.
  */
-void fill_deterministic_joint(const GameState& state, LaunchList& joint, int skip_owner) {
+void fill_deterministic_joint(const GameState& state, LaunchList& joint, int skip_owner,
+                             const CandidateWeights& weights) {
     for (int owner = 0; owner < MAX_PLAYERS; ++owner) {
         if (owner == skip_owner || !state.is_active_player(owner)) {
             continue;
         }
-        deterministic_launches_for_owner(state, owner, joint);
+        deterministic_launches_for_owner(state, owner, weights, joint);
     }
 }
 
@@ -55,7 +63,7 @@ void fill_deterministic_joint(const GameState& state, LaunchList& joint, int ski
  * @param root Root game state.
  * @param player Controlled player id.
  * @param macro Candidate macro-action to evaluate.
- * @param config Clamped search configuration.
+ * @param config Clamped search configuration (carries eval/candidate weights).
  * @param seed Deterministic branch seed.
  * @return Heuristic score after deterministic simulation.
  * @note GameState copies are value copies of fixed arrays, avoiding runtime
@@ -70,14 +78,14 @@ double evaluate_macro(const GameState& root, int player, const MacroAction& macr
     LaunchList joint{};
     joint.clear();
     append_launches(joint, macro.launches);
-    fill_deterministic_joint(sim.state, joint, player);
+    fill_deterministic_joint(sim.state, joint, player, config.candidate_weights);
     sim.step(joint);
 
     for (int depth = 1; depth < config.search_depth && !sim.state.done; ++depth) {
         joint.clear();
         for (int owner = 0; owner < MAX_PLAYERS; ++owner) {
             if (sim.state.is_active_player(owner)) {
-                deterministic_launches_for_owner(sim.state, owner, joint);
+                deterministic_launches_for_owner(sim.state, owner, config.candidate_weights, joint);
             }
         }
         sim.step(joint);
@@ -87,13 +95,13 @@ double evaluate_macro(const GameState& root, int player, const MacroAction& macr
         joint.clear();
         for (int owner = 0; owner < MAX_PLAYERS; ++owner) {
             if (sim.state.is_active_player(owner)) {
-                deterministic_launches_for_owner(sim.state, owner, joint);
+                deterministic_launches_for_owner(sim.state, owner, config.candidate_weights, joint);
             }
         }
         sim.step(joint);
     }
 
-    return evaluate_state(sim.state, player) + macro.score * 0.05;
+    return evaluate_state(sim.state, player, config.eval_weights) + macro.score * 0.05;
 }
 
 /**
@@ -112,6 +120,27 @@ LaunchList validated_fallback(const MacroActionList& macros) {
 }
 
 }  // namespace
+
+/**
+ * @brief Set the worker thread cap used by beam_search_action.
+ * @param n Requested thread count; clamped to [1, MAX_SEARCH_THREADS].
+ */
+void set_search_thread_limit(int n) {
+    if (n < 1) {
+        n = 1;
+    } else if (n > MAX_SEARCH_THREADS) {
+        n = MAX_SEARCH_THREADS;
+    }
+    g_search_thread_limit.store(n, std::memory_order_relaxed);
+}
+
+/**
+ * @brief Return the currently configured search worker thread cap.
+ * @return Effective thread limit, in [1, MAX_SEARCH_THREADS].
+ */
+int search_thread_limit() {
+    return g_search_thread_limit.load(std::memory_order_relaxed);
+}
 
 /**
  * @brief Choose a launch list by evaluating bounded root macro-actions.
@@ -134,8 +163,8 @@ LaunchList beam_search_action(const GameState& state, const SearchConfig& reques
 
     AtomicLaunchList atoms{};
     MacroActionList macros{};
-    generate_atomic_launches(state, state.player, atoms);
-    pack_macro_actions(state, state.player, atoms, macros);
+    generate_atomic_launches(state, state.player, config.candidate_weights, atoms);
+    pack_macro_actions(state, state.player, atoms, config.candidate_weights, config.eval_weights, macros);
     LaunchList fallback = validated_fallback(macros);
     if (macros.count <= 1 || budget <= 2) {
         return fallback;
@@ -165,7 +194,8 @@ LaunchList beam_search_action(const GameState& state, const SearchConfig& reques
     };
 
     std::atomic<int> cursor{0};
-    int thread_count = std::min(MAX_SEARCH_THREADS, candidate_count);
+    const int thread_cap = g_search_thread_limit.load(std::memory_order_relaxed);
+    int thread_count = std::min(thread_cap, candidate_count);
     if (thread_count <= 1) {
         worker(0, cursor);
     } else {

@@ -9,12 +9,16 @@
  */
 #include "orbit_engine.hpp"
 
+#include "candidate.hpp"
+#include "eval.hpp"
 #include "geometry.hpp"
+#include "search.hpp"
 
 #include <pybind11/pybind11.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
 namespace py = pybind11;
@@ -348,6 +352,47 @@ py::dict debug_state_to_python(const orbit::GameState& state) {
     return out;
 }
 
+/**
+ * @brief Set a single field on an EvalWeights struct, preserving others.
+ * @param target EvalWeights to mutate.
+ * @param key Field name.
+ * @param value New double value.
+ * @return true when ``key`` matched a known field.
+ */
+bool assign_eval_weight(orbit::EvalWeights& target, const std::string& key, double value) {
+    if (key == "ship")            { target.ship = value; return true; }
+    if (key == "production")      { target.production = value; return true; }
+    if (key == "territory_own")   { target.territory_own = value; return true; }
+    if (key == "territory_opp")   { target.territory_opp = value; return true; }
+    if (key == "threat")          { target.threat = value; return true; }
+    if (key == "comet_owned")     { target.comet_owned = value; return true; }
+    if (key == "comet_enemy")     { target.comet_enemy = value; return true; }
+    if (key == "comet_neutral")   { target.comet_neutral = value; return true; }
+    return false;
+}
+
+/**
+ * @brief Set a single field on a CandidateWeights struct, preserving others.
+ * @param target CandidateWeights to mutate.
+ * @param key Field name.
+ * @param value New double value.
+ * @return true when ``key`` matched a known field.
+ */
+bool assign_candidate_weight(orbit::CandidateWeights& target, const std::string& key, double value) {
+    if (key == "owner_enemy")     { target.owner_enemy = value; return true; }
+    if (key == "owner_neutral")   { target.owner_neutral = value; return true; }
+    if (key == "owner_self")      { target.owner_self = value; return true; }
+    if (key == "comet_bonus")     { target.comet_bonus = value; return true; }
+    if (key == "prod_per_unit")   { target.prod_per_unit = value; return true; }
+    if (key == "kind_exact")      { target.kind_exact = value; return true; }
+    if (key == "kind_over")       { target.kind_over = value; return true; }
+    if (key == "kind_all_safe")   { target.kind_all_safe = value; return true; }
+    if (key == "kind_harass")     { target.kind_harass = value; return true; }
+    if (key == "eta_discount")    { target.eta_discount = value; return true; }
+    if (key == "ship_cost")       { target.ship_cost = value; return true; }
+    return false;
+}
+
 /// @brief Thin Python-owned wrapper around orbit::Engine.
 class PyEngine {
 public:
@@ -400,6 +445,99 @@ public:
         return engine.debug_evaluate(player);
     }
 
+    /**
+     * @brief Replace the persisted search/evaluator/candidate configuration in one call.
+     * @param kwargs Optional keyword arguments overriding the defaults:
+     *   - ``beam_width`` (int)
+     *   - ``search_depth`` (int)
+     *   - ``rollout_horizon`` (int)
+     *   - ``hard_stop_ms`` (int)
+     *   - ``ship`` / ``production`` / ``territory_own`` / ``territory_opp`` /
+     *     ``threat`` / ``comet_owned`` / ``comet_enemy`` / ``comet_neutral`` (float)
+     *   - ``owner_enemy`` / ``owner_neutral`` / ``owner_self`` /
+     *     ``comet_bonus`` / ``prod_per_unit`` / ``kind_exact`` / ``kind_over`` /
+     *     ``kind_all_safe`` / ``kind_harass`` / ``eta_discount`` / ``ship_cost`` (float)
+     * @note Missing keys keep their existing values, so the method is fully
+     *       additive and safe to call repeatedly during tuning.
+     */
+    void set_hyperparameters(const py::kwargs& kwargs) {
+        orbit::SearchConfig cfg = engine.config;
+        for (auto item : kwargs) {
+            const std::string key = py::cast<std::string>(item.first);
+            const py::handle value = item.second;
+            if (key == "beam_width") {
+                cfg.beam_width = py::cast<int>(value);
+            } else if (key == "search_depth") {
+                cfg.search_depth = py::cast<int>(value);
+            } else if (key == "rollout_horizon") {
+                cfg.rollout_horizon = py::cast<int>(value);
+            } else if (key == "hard_stop_ms") {
+                cfg.hard_stop_ms = py::cast<int>(value);
+            } else {
+                const double dvalue = py::cast<double>(value);
+                if (assign_eval_weight(cfg.eval_weights, key, dvalue)) {
+                    continue;
+                }
+                if (assign_candidate_weight(cfg.candidate_weights, key, dvalue)) {
+                    continue;
+                }
+                throw std::invalid_argument("orbit_engine.set_hyperparameters: unknown key '" + key + "'");
+            }
+        }
+        engine.set_search_config(cfg);
+    }
+
+    /**
+     * @brief Return a shallow copy of the persisted search configuration.
+     * @return Python dict mirroring the native SearchConfig.
+     */
+    py::dict get_hyperparameters() const {
+        const orbit::SearchConfig& cfg = engine.config;
+        py::dict out;
+        out["beam_width"] = cfg.beam_width;
+        out["search_depth"] = cfg.search_depth;
+        out["rollout_horizon"] = cfg.rollout_horizon;
+        out["hard_stop_ms"] = cfg.hard_stop_ms;
+        out["weight_ship"] = cfg.eval_weights.ship;
+        out["weight_production"] = cfg.eval_weights.production;
+        out["weight_territory_own"] = cfg.eval_weights.territory_own;
+        out["weight_territory_opp"] = cfg.eval_weights.territory_opp;
+        out["weight_threat"] = cfg.eval_weights.threat;
+        out["weight_comet_owned"] = cfg.eval_weights.comet_owned;
+        out["weight_comet_enemy"] = cfg.eval_weights.comet_enemy;
+        out["weight_comet_neutral"] = cfg.eval_weights.comet_neutral;
+        out["weight_owner_enemy"] = cfg.candidate_weights.owner_enemy;
+        out["weight_owner_neutral"] = cfg.candidate_weights.owner_neutral;
+        out["weight_owner_self"] = cfg.candidate_weights.owner_self;
+        out["weight_comet_bonus"] = cfg.candidate_weights.comet_bonus;
+        out["weight_prod_per_unit"] = cfg.candidate_weights.prod_per_unit;
+        out["weight_kind_exact"] = cfg.candidate_weights.kind_exact;
+        out["weight_kind_over"] = cfg.candidate_weights.kind_over;
+        out["weight_kind_all_safe"] = cfg.candidate_weights.kind_all_safe;
+        out["weight_kind_harass"] = cfg.candidate_weights.kind_harass;
+        out["weight_eta_discount"] = cfg.candidate_weights.eta_discount;
+        out["weight_ship_cost"] = cfg.candidate_weights.ship_cost;
+        return out;
+    }
+
+    /**
+     * @brief Set the maximum number of search worker threads for this process.
+     * @param n Requested thread count; clamped to [1, MAX_SEARCH_THREADS].
+     * @note tune.py forces this to 1 when ``n_jobs`` Optuna trials run in parallel
+     *       to prevent host oversubscription. The Kaggle runtime never calls it.
+     */
+    void set_search_thread_limit(int n) {
+        orbit::set_search_thread_limit(n);
+    }
+
+    /**
+     * @brief Read the current search worker thread cap.
+     * @return Effective thread limit applied to beam_search_action.
+     */
+    int get_search_thread_limit() const {
+        return orbit::search_thread_limit();
+    }
+
 private:
     orbit::Engine engine;
 };
@@ -414,7 +552,7 @@ private:
  */
 PYBIND11_MODULE(orbit_engine, m) {
     m.doc() = "Fixed-buffer C++ engine for Kaggle Orbit Wars.";
-    m.attr("__version__") = "0.1.0";
+    m.attr("__version__") = "0.2.0";
 
     py::class_<PyEngine>(m, "Engine")
         .def(py::init<int>(), py::arg("player") = 0)
@@ -428,8 +566,20 @@ PYBIND11_MODULE(orbit_engine, m) {
         .def("debug_state", &PyEngine::debug_state,
              "Return live planets and fleets from the native simulator.")
         .def("debug_evaluate", &PyEngine::debug_evaluate, py::arg("player") = -1,
-             "Evaluate the native state for a player.");
+             "Evaluate the native state for a player.")
+        .def("set_hyperparameters", &PyEngine::set_hyperparameters,
+             "Inject search/evaluator/candidate hyperparameters as keyword arguments.")
+        .def("get_hyperparameters", &PyEngine::get_hyperparameters,
+             "Return a Python dict snapshot of the active configuration.")
+        .def("set_search_thread_limit", &PyEngine::set_search_thread_limit, py::arg("n"),
+             "Cap the number of worker threads the C++ search can spawn per call.")
+        .def("get_search_thread_limit", &PyEngine::get_search_thread_limit,
+             "Return the current C++ search worker thread cap.");
 
     m.def("speed_for_ships", &orbit::speed_for_ships, py::arg("ships"),
           "Return the Orbit Wars rule speed for a fleet size.");
+    m.def("set_search_thread_limit", &orbit::set_search_thread_limit, py::arg("n"),
+          "Process-wide cap on C++ search worker threads.");
+    m.def("get_search_thread_limit", &orbit::search_thread_limit,
+          "Process-wide cap on C++ search worker threads.");
 }

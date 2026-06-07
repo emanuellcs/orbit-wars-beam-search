@@ -5,6 +5,10 @@
  * Candidate generation converts the continuous game state into a fixed set of
  * analytically aimed packets. Macro packing then combines those packets while
  * preserving per-source spend legality, giving search a bounded action frontier.
+ *
+ * @note The tunable ``CandidateWeights`` bundle is declared in
+ *       ``orbit_engine.hpp`` so that ``Engine`` can hold it by value without
+ *       introducing a circular include.
  */
 #pragma once
 
@@ -93,22 +97,29 @@ int defensive_reserve(const GameState& state, int source_index, int player);
 /// @brief Generate ranked atomic launches from owned sources to non-owned targets.
 /// @param state Current game state.
 /// @param player Controlled player id.
+/// @param weights Tunable scoring weights; defaults reproduce the prior formula.
 /// @param out Output atomic launch buffer.
 /// @note Uses solve_intercept so every packet has an analytic angle and tau.
-void generate_atomic_launches(const GameState& state, int player, AtomicLaunchList& out);
+void generate_atomic_launches(const GameState& state, int player,
+                              const CandidateWeights& weights, AtomicLaunchList& out);
 /// @brief Pack sorted atomic launches into legal macro-actions.
 /// @param state Current game state.
 /// @param player Controlled player id.
 /// @param atoms Sorted atomic launch candidates.
+/// @param weights Tunable scoring weights; defaults reproduce the prior formula.
+/// @param eval_weights Tunable evaluator weights used for the idle-macro prior.
 /// @param out Output macro-action buffer.
 /// @note Per-source spend arrays prevent overspending without dynamic maps.
 void pack_macro_actions(const GameState& state, int player, const AtomicLaunchList& atoms,
+                        const CandidateWeights& weights, const EvalWeights& eval_weights,
                         MacroActionList& out);
 /// @brief Deterministic policy used for rollout opponents and fallback behavior.
 /// @param state Current game state.
 /// @param owner Owner id to act for.
+/// @param weights Tunable scoring weights used for the deterministic launch set.
 /// @param out Launch buffer to append into.
 /// @note This intentionally shares candidate logic with search for repeatability.
-void deterministic_launches_for_owner(const GameState& state, int owner, LaunchList& out);
+void deterministic_launches_for_owner(const GameState& state, int owner,
+                                      const CandidateWeights& weights, LaunchList& out);
 
 }  // namespace orbit

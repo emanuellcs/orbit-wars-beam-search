@@ -27,11 +27,24 @@ except Exception as exc:  # pragma: no cover
 
 
 _ENGINES = {}
+_HYPERPARAMS = {}
 _JIT_ATTEMPTED = False
 try:
     _ROOT = Path(__file__).resolve().parent
 except NameError:
     _ROOT = Path(os.getcwd()).resolve()
+
+
+_ALLOWED_INT_HYPERPARAMS = ("beam_width", "search_depth", "rollout_horizon", "hard_stop_ms")
+_ALLOWED_WEIGHT_KEYS = (
+    "ship", "production", "territory_own", "territory_opp", "threat",
+    "comet_owned", "comet_enemy", "comet_neutral",
+    "owner_enemy", "owner_neutral", "owner_self",
+    "comet_bonus", "prod_per_unit",
+    "kind_exact", "kind_over", "kind_all_safe", "kind_harass",
+    "eta_discount", "ship_cost",
+)
+_ALLOWED_BOOL_HYPERPARAMS = ()
 
 
 def _jit_log(message):
@@ -179,6 +192,74 @@ def _get(obj, name, default=None):
     return getattr(obj, name, default)
 
 
+def set_hyperparameters(**kwargs):
+    """Inject search/evaluator/candidate hyperparameters into the native engine.
+
+    Recognized keyword arguments:
+
+    - Integer search limits: ``beam_width``, ``search_depth``, ``rollout_horizon``,
+      ``hard_stop_ms``.
+    - Heuristic evaluator weights: ``ship``, ``production``, ``territory_own``,
+      ``territory_opp``, ``threat``, ``comet_owned``, ``comet_enemy``,
+      ``comet_neutral``.
+    - Atomic-launch scoring weights: ``owner_enemy``, ``owner_neutral``,
+      ``owner_self``, ``comet_bonus``, ``prod_per_unit``, ``kind_exact``,
+      ``kind_over``, ``kind_all_safe``, ``kind_harass``, ``eta_discount``,
+      ``ship_cost``.
+    - Special runtime keys: ``search_threads`` (int) caps the C++ search worker
+      pool per process; tune.py forces this to ``1`` to avoid oversubscribing
+      the host when ``n_jobs`` parallel trials are launched.
+
+    The full configuration is reapplied to every cached per-player engine and
+    the cache itself is cleared so subsequent ``agent()`` calls rebuild
+    engines with the new configuration. Returns the resolved hyperparameter
+    dict that will be applied to new engines.
+    """
+
+    global _HYPERPARAMS
+    accepted = set(_ALLOWED_INT_HYPERPARAMS) | set(_ALLOWED_WEIGHT_KEYS) | set(_ALLOWED_BOOL_HYPERPARAMS) | {"search_threads"}
+    for key in kwargs:
+        if key not in accepted:
+            raise TypeError(
+                f"set_hyperparameters: unknown hyperparameter '{key}'. "
+                f"Allowed: {sorted(accepted)}"
+            )
+    _HYPERPARAMS.update({k: v for k, v in kwargs.items()})
+
+    if orbit_engine is not None:
+        engine_kwargs = {k: v for k, v in _HYPERPARAMS.items() if k != "search_threads"}
+        for engine in _ENGINES.values():
+            try:
+                if engine_kwargs:
+                    engine.set_hyperparameters(**engine_kwargs)
+            except Exception:
+                pass
+        threads = _HYPERPARAMS.get("search_threads")
+        if threads is not None:
+            try:
+                orbit_engine.set_search_thread_limit(int(threads))
+            except Exception:
+                pass
+    _ENGINES.clear()
+    return dict(_HYPERPARAMS)
+
+
+def get_hyperparameters():
+    """Return the currently configured hyperparameter dict (read-only copy)."""
+
+    return dict(_HYPERPARAMS)
+
+
+def _apply_hyperparams_to_engine(engine):
+    """Apply the module-level hyperparameter dict to a freshly built engine."""
+
+    if not _HYPERPARAMS or engine is None:
+        return
+    engine_kwargs = {k: v for k, v in _HYPERPARAMS.items() if k != "search_threads"}
+    if engine_kwargs:
+        engine.set_hyperparameters(**engine_kwargs)
+
+
 def _fallback_agent(obs):
     """Return a conservative nearest-capture action list without native code.
 
@@ -254,6 +335,7 @@ def agent(obs, config=None):
     engine = _ENGINES.get(player)
     if engine is None:
         engine = orbit_engine.Engine(player)
+        _apply_hyperparams_to_engine(engine)
         _ENGINES[player] = engine
     step = int(_get(obs, "step", 0))
     engine.update_observation(obs)
