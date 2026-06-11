@@ -72,14 +72,12 @@ Testing/
 .cache/
 
 # Optuna tuning artifacts
-tune.db
-tune.db-journal
+*.db
+*.db-journal
 *.optuna-journal
 
 # Opponents package cache
 opponents/__pycache__/
-
-.devcontainer/
 
 .pytest_cache/
 __pycache__/

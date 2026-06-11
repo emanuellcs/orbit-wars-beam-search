@@ -18,7 +18,7 @@ The core breakthrough is not brute-force angle sampling. The engine shrinks the 
 - **Analytic interception:** static targets use direct headings; orbiting planets and comets solve a bounded time-of-arrival equation over $`\tau \in [1, 120]`$.
 - **Beam-style root evaluator:** the engine evaluates up to 384 packed macro-actions by default, rolls each forward through deterministic opponent policies, and selects the best state-evaluated branch within the 900 ms Kaggle action budget.
 - **Runtime hyperparameter injection:** `set_hyperparameters(kwargs)` retunes search depth, candidate prior weights, and evaluator weights through the pybind11 bridge in a single call; defaults reproduce the original hand-tuned values bit-for-bit.
-- **Optuna tuning harness:** `tune.py` runs a parallelized Bayesian-Optimization study over all 22 exposed hyperparameters, persists trials to SQLite, and matches the controlled agent against a directory of opponent policies.
+- **Optuna tuning harness:** `tune.py` runs a multi-process Bayesian-Optimization study over all 22 exposed hyperparameters. By utilizing a `ProcessPoolExecutor` and Optuna's Ask-and-Tell API, the harness bypasses the Python GIL, enabling full multi-core scaling while persisting trials to SQLite.
 - **Kaggle-safe deployment:** `main.py` imports a prebuilt extension when available and can JIT-compile the extension inside the submission bundle using vendored pybind11 headers.
 
 ## Competition Overview
@@ -61,7 +61,7 @@ Combat groups all arriving fleets by owner. The largest arriving force fights th
 | --- | --- |
 | `main.py` | Kaggle entrypoint, native import/JIT compilation, Python fallback agent, runtime hyperparameter injection |
 | `submission.py` | Local alias exporting `agent` from `main.py` |
-| `tune.py` | Optuna-based parallelized tuning harness with multiprocessing spawn workers and SQLite storage |
+| `tune.py` | Optuna-based multi-process tuning harness with Ask-and-Tell orchestration and SQLite storage |
 | `opponents/` | Drop-in opponent policies (`baseline.py`, `greedy.py`, `mirror.py`) sampled by the tuning harness |
 | `src/orbit_engine.hpp` | Public engine facade, `EvalWeights`/`CandidateWeights`/`SearchConfig` structs, fixed capacities, SoA buffers |
 | `src/orbit_engine_state.cpp` | Observation ingestion, orbit/comet metadata, state reconstruction |
@@ -515,14 +515,14 @@ The `opponents/` package holds drop-in Python policies for the tuning harness:
 
 ### Optuna harness
 
-`tune.py` wraps the native engine in a multiprocessing-spawn Optuna study:
+`tune.py` wraps the native engine in a high-performance multi-process Optuna study:
 
-- Required CLI flags: `--trials`, `--n-jobs`, `--seeds`, `--time-budget`, `--storage`, `--study-name`.
-- Optional flags: `--max-steps`, `--ffa-prob`, `--timeout`, `--seed-offset`.
-- Objective: composite `100*win + 20*draw + 1*ship_margin + 0.5*score_z` (win-rate-dominated).
-- TPE sampler with `multivariate=True, group=True` so correlated hyperparameters explore jointly.
-- Per trial: sample hyperparameters, call `main.set_hyperparameters(search_threads=1, **hp)`, play `--seeds` matches (1v1 or 4-player FFA by `--ffa-prob` coin flip) against an opponent sampled from `opponents/`, aggregate metrics, and prune on wall-clock budget exhaustion.
-- The whole trial body is wrapped in `try/except` so any single crash returns `-1e6` and the study survives; per-match crashes are logged and skipped, not trial-fatal.
+- **GIL Bypass:** Uses `concurrent.futures.ProcessPoolExecutor` and Optuna's **Ask-and-Tell** API to bypass the Python Global Interpreter Lock (GIL). This allows `n_jobs` parallel processes to utilize all available CPU cores simultaneously.
+- **Worker Isolation:** Each trial runs in a dedicated `spawn` process. Hyperparameters are sampled in the main thread and passed to workers via a picklable evaluation function.
+- **Stability:** The harness forces `set_search_thread_limit(1)` per trial, ensuring C++ search threads don't oversubscribe the host machine.
+- **Orchestration:** Active trial management keeps the worker pool saturated even as trials finish at different rates.
+- **Required CLI flags:** `--trials`, `--n-jobs`, `--seeds`, `--time-budget`, `--storage`, `--study-name`.
+- **Composite Objective:** `100*win + 20*draw + 1*ship_margin + 0.5*score_z` (win-rate-dominated).
 
 Run it after building the extension:
 

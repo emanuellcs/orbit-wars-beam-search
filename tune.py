@@ -63,8 +63,10 @@ except RuntimeError:
     # start method already locked by a prior call; that is fine.
     pass
 
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import optuna
 from optuna.samplers import TPESampler
+from optuna.trial import TrialState
 
 # Cap the C++ search worker thread pool BEFORE main.py imports the native
 # module. With the default MAX_SEARCH_THREADS=20 the search thrashes a
@@ -309,23 +311,25 @@ class _Deadline:
         return time.monotonic() >= self._end
 
 
-def _evaluate_trial(trial: optuna.Trial, args: argparse.Namespace,
-                    deadline: _Deadline) -> float:
+def _evaluate_trial(trial_number: int, hp: Dict[str, Any], args: argparse.Namespace,
+                    deadline: _Deadline) -> tuple[Optional[float], Dict[str, Any]]:
     """Score one Optuna trial over ``args.seeds`` episodes.
 
+    This function is designed to run in a worker process (safe pickling).
+
     Args:
-        trial: Optuna trial handle.
+        trial_number: Index of the trial being evaluated.
+        hp: Pre-sampled hyperparameters for this trial.
         args: Parsed CLI arguments.
         deadline: Wall-clock deadline checked before every match.
 
     Returns:
-        float: Composite objective score. ``_FAILURE_SCORE`` for crashes.
+        tuple: (composite_score, user_attrs_dict). composite_score is None if pruned.
     """
 
     if deadline.exceeded():
-        raise optuna.TrialPruned("wall-clock budget exhausted before trial started")
+        return None, {}
 
-    hp = _sample_hyperparameters(trial)
     # Force the C++ search to use a single worker thread per process so the
     # ``n_jobs`` parallel trials don't oversubscribe the host machine. The
     # ``search_threads`` kwarg is special: it does not change the SearchConfig
@@ -334,24 +338,23 @@ def _evaluate_trial(trial: optuna.Trial, args: argparse.Namespace,
         main.set_hyperparameters(search_threads=1, **hp)
     except Exception as exc:  # noqa: BLE001
         _LOG.warning("set_hyperparameters failed: %s", exc)
-        return _FAILURE_SCORE
+        return _FAILURE_SCORE, {"failure": str(exc)}
 
-    rng = random.Random(trial.number + args.seed_offset)
+    rng = random.Random(trial_number + args.seed_offset)
     metrics: List[Dict[str, float]] = []
     for seed_idx in range(args.seeds):
         if deadline.exceeded():
-            raise optuna.TrialPruned("wall-clock budget exhausted mid-trial")
+            break
         try:
             result = _play_one_episode(rng, args.ffa_prob, args.max_steps, args.timeout)
         except Exception as exc:  # noqa: BLE001
-            _LOG.warning("trial %d seed %d crashed: %s", trial.number, seed_idx, exc)
+            _LOG.warning("trial %d seed %d crashed: %s", trial_number, seed_idx, exc)
             continue
         if result is not None:
             metrics.append(result)
 
     if not metrics:
-        trial.set_user_attr("failure", "all seeds crashed")
-        return _FAILURE_SCORE
+        return _FAILURE_SCORE, {"failure": "all seeds crashed"}
 
     win_rate      = sum(m["win"] for m in metrics) / len(metrics)
     draw_rate     = sum(m["draw"] for m in metrics) / len(metrics)
@@ -363,12 +366,14 @@ def _evaluate_trial(trial: optuna.Trial, args: argparse.Namespace,
                  + 1.0 * ship_margin
                  + 0.5 * score_z)
 
-    trial.set_user_attr("win_rate", win_rate)
-    trial.set_user_attr("draw_rate", draw_rate)
-    trial.set_user_attr("ship_margin", ship_margin)
-    trial.set_user_attr("score_z", score_z)
-    trial.set_user_attr("n_matches", len(metrics))
-    return composite
+    attrs = {
+        "win_rate": win_rate,
+        "draw_rate": draw_rate,
+        "ship_margin": ship_margin,
+        "score_z": score_z,
+        "n_matches": len(metrics),
+    }
+    return composite, attrs
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -430,27 +435,63 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
         flush=True,
     )
 
-    def _objective(trial: optuna.Trial) -> float:
-        return _evaluate_trial(trial, args, deadline)
+    n_submitted = 0
+    n_completed = 0
+    active_futures = {}
 
-    try:
-        study.optimize(
-            _objective,
-            n_trials=args.trials,
-            n_jobs=args.n_jobs,
-            timeout=args.time_budget,
-            show_progress_bar=False,
-        )
-    except KeyboardInterrupt:
-        print("[tune] interrupted; partial study preserved", flush=True)
-    except Exception:
-        print("[tune] optimization failed:", flush=True)
-        traceback.print_exc()
+    with ProcessPoolExecutor(max_workers=args.n_jobs) as executor:
+        try:
+            while n_completed < args.trials and not deadline.exceeded():
+                # Fill the pool
+                while len(active_futures) < args.n_jobs and n_submitted < args.trials and not deadline.exceeded():
+                    trial = study.ask()
+                    hp = _sample_hyperparameters(trial)
+                    future = executor.submit(_evaluate_trial, trial.number, hp, args, deadline)
+                    active_futures[future] = trial
+                    n_submitted += 1
 
-    print("[tune] best value:", study.best_value)
+                if not active_futures:
+                    break
+
+                # Wait for at least one trial to finish
+                done, _ = wait(
+                    active_futures.keys(),
+                    timeout=1.0,
+                    return_when=FIRST_COMPLETED
+                )
+
+                for future in done:
+                    trial = active_futures.pop(future)
+                    try:
+                        score, attrs = future.result()
+                        if score is None:
+                            study.tell(trial, state=TrialState.PRUNED)
+                            print(f"[tune] trial {trial.number} pruned (deadline)", flush=True)
+                        else:
+                            for k, v in attrs.items():
+                                trial.set_user_attr(k, v)
+                            study.tell(trial, score)
+                            print(f"[tune] trial {trial.number} completed score={score:.2f}", flush=True)
+                    except Exception as exc:
+                        print(f"[tune] trial {trial.number} raised exception: {exc}", flush=True)
+                        traceback.print_exc()
+                        study.tell(trial, state=TrialState.FAIL)
+                    
+                    n_completed += 1
+
+        except KeyboardInterrupt:
+            print("[tune] interrupted; partial study preserved", flush=True)
+            for future in active_futures:
+                future.cancel()
+        except Exception:
+            print("[tune] optimization failed:", flush=True)
+            traceback.print_exc()
+
+    print("[tune] best value:", study.best_value if study.trials else "N/A")
     print("[tune] best params:")
-    for key, value in study.best_params.items():
-        print(f"  {key} = {value}")
+    if study.trials:
+        for key, value in study.best_params.items():
+            print(f"  {key} = {value}")
     return 0
 
 
