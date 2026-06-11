@@ -201,10 +201,11 @@ def _play_match(agents: List[Any], seed: int, episode_steps: int,
     """
 
     # Local imports keep the cold start cheap in the spawn workers.
+    import concurrent.futures
     from kaggle_environments import evaluate
 
-    try:
-        results = evaluate(
+    def _run_eval():
+        return evaluate(
             "orbit_wars",
             agents=agents,
             configuration={
@@ -214,6 +215,15 @@ def _play_match(agents: List[Any], seed: int, episode_steps: int,
             num_episodes=1,
             debug=False,
         )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_eval)
+            try:
+                results = future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                _LOG.warning("match timed out after %.2f seconds", timeout)
+                return None
     except Exception as exc:  # noqa: BLE001
         _LOG.warning("kaggle env crashed: %s", exc)
         return None
