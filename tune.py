@@ -64,6 +64,7 @@ except RuntimeError:
     pass
 
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED, TimeoutError
+from concurrent.futures.process import BrokenProcessPool
 import optuna
 from optuna.samplers import TPESampler
 from optuna.trial import TrialState
@@ -484,10 +485,26 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
                     return_when=FIRST_COMPLETED
                 )
 
+                pool_broken = False
                 for future in done:
                     trial = active_futures.pop(future)
                     try:
                         result = future.result()
+                    except BrokenProcessPool:
+                        _LOG.critical("Process pool broken! Failing all remaining trials...")
+                        study.tell(trial, state=TrialState.FAIL)
+                        for pending_future, pending_trial in active_futures.items():
+                            study.tell(pending_trial, state=TrialState.FAIL)
+                        active_futures.clear()
+                        pool_broken = True
+                        break
+                    except Exception:
+                        _LOG.error("Trial %d failed:\n%s", trial.number, traceback.format_exc())
+                        study.tell(trial, state=TrialState.FAIL)
+                        n_completed += 1
+                        continue
+
+                    try:
                         if not isinstance(result, tuple) or len(result) != 2:
                             _LOG.error(
                                 "Trial %d returned unexpected type %s – expected (score, attrs) tuple",
@@ -504,11 +521,13 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
                                     trial.set_user_attr(k, v)
                                 study.tell(trial, score)
                                 print(f"[tune] trial {trial.number} completed score={score:.2f}", flush=True)
-                    except Exception:
-                        _LOG.error("Trial %d failed:\n%s", trial.number, traceback.format_exc())
-                        study.tell(trial, state=TrialState.FAIL)
+                    except Exception as exc:  # noqa: BLE001
+                        _LOG.error("Trial %d tell() failed:\n%s", trial.number, exc)
                     
                     n_completed += 1
+
+                if pool_broken:
+                    break
 
             if active_futures:
                 print(f"[tune] Main loop exited. Draining {len(active_futures)} pending futures...", flush=True)
