@@ -326,7 +326,7 @@ class _Deadline:
 
 
 def _evaluate_trial(trial_number: int, hp: Dict[str, Any], args: argparse.Namespace,
-                    deadline: _Deadline) -> tuple[Optional[float], Dict[str, Any]]:
+                    global_deadline_ts: float) -> tuple[Optional[float], Dict[str, Any]]:
     """Score one Optuna trial over ``args.seeds`` episodes.
 
     This function is designed to run in a worker process (safe pickling).
@@ -335,13 +335,13 @@ def _evaluate_trial(trial_number: int, hp: Dict[str, Any], args: argparse.Namesp
         trial_number: Index of the trial being evaluated.
         hp: Pre-sampled hyperparameters for this trial.
         args: Parsed CLI arguments.
-        deadline: Wall-clock deadline checked before every match.
+        global_deadline_ts: Wall-clock deadline timestamp checked before every match.
 
     Returns:
         tuple: (composite_score, user_attrs_dict). composite_score is None if pruned.
     """
 
-    if deadline.exceeded():
+    if time.monotonic() >= global_deadline_ts:
         return None, {}
 
     # Bulletproof the project root in sys.path for spawn workers. Even though
@@ -368,7 +368,7 @@ def _evaluate_trial(trial_number: int, hp: Dict[str, Any], args: argparse.Namesp
     rng = random.Random(trial_number + args.seed_offset)
     metrics: List[Dict[str, float]] = []
     for seed_idx in range(args.seeds):
-        if deadline.exceeded():
+        if time.monotonic() >= global_deadline_ts:
             break
         try:
             result = _play_one_episode(rng, args.ffa_prob, args.max_steps, args.timeout)
@@ -475,7 +475,7 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
                 while len(active_futures) < args.n_jobs and n_submitted < args.trials and not deadline.exceeded():
                     trial = study.ask()
                     hp = _sample_hyperparameters(trial)
-                    future = executor.submit(_evaluate_trial, trial.number, hp, args, deadline)
+                    future = executor.submit(_evaluate_trial, trial.number, hp, args, deadline._end)
                     active_futures[future] = trial
                     n_submitted += 1
 
