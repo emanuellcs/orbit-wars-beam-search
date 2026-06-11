@@ -525,10 +525,9 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
                                     trial.set_user_attr(k, v)
                                 study.tell(trial, score)
                                 print(f"[tune] trial {trial.number} completed score={score:.2f}", flush=True)
+                        n_completed += 1
                     except Exception as exc:  # noqa: BLE001
                         _LOG.error("Trial %d tell() failed:\n%s", trial.number, exc)
-                    
-                    n_completed += 1
 
                 if pool_broken:
                     break
@@ -559,9 +558,21 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
             print("[tune] interrupted; partial study preserved", flush=True)
             for future in active_futures:
                 future.cancel()
+            for trial in active_futures.values():
+                try:
+                    study.tell(trial, state=TrialState.FAIL)
+                except Exception:  # noqa: BLE001
+                    pass
+            active_futures.clear()
         except Exception:
             print("[tune] optimization failed:", flush=True)
             traceback.print_exc()
+            for trial in active_futures.values():
+                try:
+                    study.tell(trial, state=TrialState.FAIL)
+                except Exception:  # noqa: BLE001
+                    pass
+            active_futures.clear()
 
     complete_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
     if complete_trials:
