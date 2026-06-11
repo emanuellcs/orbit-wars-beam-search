@@ -67,6 +67,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED, Timeo
 from concurrent.futures.process import BrokenProcessPool
 import optuna
 from optuna.samplers import TPESampler
+from optuna.storages import RDBStorage
 from optuna.trial import TrialState
 
 # Cap the C++ search worker thread pool BEFORE main.py imports the native
@@ -444,9 +445,13 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
         group=True,
         n_startup_trials=min(20, max(1, args.trials // 50)),
     )
+    db_storage = RDBStorage(
+        url=args.storage,
+        engine_kwargs={"connect_args": {"timeout": 60.0}}
+    )
     study = optuna.create_study(
         study_name=args.study_name,
-        storage=args.storage,
+        storage=db_storage,
         sampler=sampler,
         direction="maximize",
         load_if_exists=True,
