@@ -18,7 +18,7 @@ The core breakthrough is not brute-force angle sampling. The engine shrinks the 
 - **Analytic interception:** static targets use direct headings; orbiting planets and comets solve a bounded time-of-arrival equation over $`\tau \in [1, 120]`$.
 - **Beam-style root evaluator:** the engine evaluates up to 384 packed macro-actions by default, rolls each forward through deterministic opponent policies, and selects the best state-evaluated branch within the 900 ms Kaggle action budget.
 - **Runtime hyperparameter injection:** `set_hyperparameters(kwargs)` retunes search depth, candidate prior weights, and evaluator weights through the pybind11 bridge in a single call; defaults reproduce the original hand-tuned values bit-for-bit.
-- **Optuna tuning harness:** `tune.py` runs a multi-process Bayesian-Optimization study over all 22 exposed hyperparameters. By utilizing a `ProcessPoolExecutor` and Optuna's Ask-and-Tell API, the harness bypasses the Python GIL, enabling full multi-core scaling while persisting trials to SQLite.
+- **Optuna tuning harness:** `tune.py` runs a multi-process Bayesian-Optimization study over all 22 exposed hyperparameters. It utilizes a `ProcessPoolExecutor` with robust `BrokenProcessPool` recovery, a cooperative drain phase for pending futures, and an optimized SQLite storage layer with a 60s busy timeout to handle high-concurrency write contention. Environment evaluations are strictly wall-clock bounded via `ThreadPoolExecutor`.
 - **Kaggle-safe deployment:** `main.py` imports a prebuilt extension when available and can JIT-compile the extension inside the submission bundle using vendored pybind11 headers.
 
 ## Competition Overview

@@ -63,9 +63,11 @@ except RuntimeError:
     # start method already locked by a prior call; that is fine.
     pass
 
-from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED, TimeoutError
+from concurrent.futures.process import BrokenProcessPool
 import optuna
 from optuna.samplers import TPESampler
+from optuna.storages import RDBStorage
 from optuna.trial import TrialState
 
 # Cap the C++ search worker thread pool BEFORE main.py imports the native
@@ -181,8 +183,7 @@ def _select_match_shape(rng: random.Random, ffa_prob: float) -> str:
 def _build_agents(controlled: Any, shape: str, opponent_names: Sequence[str]) -> List[Any]:
     """Build a Kaggle agent list with the controlled agent at index 0."""
 
-    return resolve_agent_list(controlled, opponent_names) if shape == "1v1" \
-        else resolve_agent_list(controlled, opponent_names)
+    return resolve_agent_list(controlled, opponent_names)
 
 
 def _play_match(agents: List[Any], seed: int, episode_steps: int,
@@ -201,10 +202,11 @@ def _play_match(agents: List[Any], seed: int, episode_steps: int,
     """
 
     # Local imports keep the cold start cheap in the spawn workers.
+    import concurrent.futures
     from kaggle_environments import evaluate
 
-    try:
-        results = evaluate(
+    def _run_eval():
+        return evaluate(
             "orbit_wars",
             agents=agents,
             configuration={
@@ -214,6 +216,15 @@ def _play_match(agents: List[Any], seed: int, episode_steps: int,
             num_episodes=1,
             debug=False,
         )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_eval)
+            try:
+                results = future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                _LOG.warning("match timed out after %.2f seconds", timeout)
+                return None
     except Exception as exc:  # noqa: BLE001
         _LOG.warning("kaggle env crashed: %s", exc)
         return None
@@ -315,7 +326,7 @@ class _Deadline:
 
 
 def _evaluate_trial(trial_number: int, hp: Dict[str, Any], args: argparse.Namespace,
-                    deadline: _Deadline) -> tuple[Optional[float], Dict[str, Any]]:
+                    global_deadline_ts: float) -> tuple[Optional[float], Dict[str, Any]]:
     """Score one Optuna trial over ``args.seeds`` episodes.
 
     This function is designed to run in a worker process (safe pickling).
@@ -324,13 +335,13 @@ def _evaluate_trial(trial_number: int, hp: Dict[str, Any], args: argparse.Namesp
         trial_number: Index of the trial being evaluated.
         hp: Pre-sampled hyperparameters for this trial.
         args: Parsed CLI arguments.
-        deadline: Wall-clock deadline checked before every match.
+        global_deadline_ts: Wall-clock deadline timestamp checked before every match.
 
     Returns:
         tuple: (composite_score, user_attrs_dict). composite_score is None if pruned.
     """
 
-    if deadline.exceeded():
+    if time.monotonic() >= global_deadline_ts:
         return None, {}
 
     # Bulletproof the project root in sys.path for spawn workers. Even though
@@ -357,7 +368,7 @@ def _evaluate_trial(trial_number: int, hp: Dict[str, Any], args: argparse.Namesp
     rng = random.Random(trial_number + args.seed_offset)
     metrics: List[Dict[str, float]] = []
     for seed_idx in range(args.seeds):
-        if deadline.exceeded():
+        if time.monotonic() >= global_deadline_ts:
             break
         try:
             result = _play_one_episode(rng, args.ffa_prob, args.max_steps, args.timeout)
@@ -433,9 +444,13 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
         group=True,
         n_startup_trials=min(20, max(1, args.trials // 50)),
     )
+    db_storage = RDBStorage(
+        url=args.storage,
+        engine_kwargs={"connect_args": {"timeout": 60.0}}
+    )
     study = optuna.create_study(
         study_name=args.study_name,
-        storage=args.storage,
+        storage=db_storage,
         sampler=sampler,
         direction="maximize",
         load_if_exists=True,
@@ -460,7 +475,7 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
                 while len(active_futures) < args.n_jobs and n_submitted < args.trials and not deadline.exceeded():
                     trial = study.ask()
                     hp = _sample_hyperparameters(trial)
-                    future = executor.submit(_evaluate_trial, trial.number, hp, args, deadline)
+                    future = executor.submit(_evaluate_trial, trial.number, hp, args, deadline._end)
                     active_futures[future] = trial
                     n_submitted += 1
 
@@ -474,10 +489,26 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
                     return_when=FIRST_COMPLETED
                 )
 
+                pool_broken = False
                 for future in done:
                     trial = active_futures.pop(future)
                     try:
                         result = future.result()
+                    except BrokenProcessPool:
+                        _LOG.critical("Process pool broken! Failing all remaining trials...")
+                        study.tell(trial, state=TrialState.FAIL)
+                        for pending_future, pending_trial in active_futures.items():
+                            study.tell(pending_trial, state=TrialState.FAIL)
+                        active_futures.clear()
+                        pool_broken = True
+                        break
+                    except Exception:
+                        _LOG.error("Trial %d failed:\n%s", trial.number, traceback.format_exc())
+                        study.tell(trial, state=TrialState.FAIL)
+                        n_completed += 1
+                        continue
+
+                    try:
                         if not isinstance(result, tuple) or len(result) != 2:
                             _LOG.error(
                                 "Trial %d returned unexpected type %s – expected (score, attrs) tuple",
@@ -494,19 +525,54 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
                                     trial.set_user_attr(k, v)
                                 study.tell(trial, score)
                                 print(f"[tune] trial {trial.number} completed score={score:.2f}", flush=True)
-                    except Exception:
-                        _LOG.error("Trial %d failed:\n%s", trial.number, traceback.format_exc())
+                        n_completed += 1
+                    except Exception as exc:  # noqa: BLE001
+                        _LOG.error("Trial %d tell() failed:\n%s", trial.number, exc)
+
+                if pool_broken:
+                    break
+
+            if active_futures:
+                print(f"[tune] Main loop exited. Draining {len(active_futures)} pending futures...", flush=True)
+                for future, trial in list(active_futures.items()):
+                    try:
+                        result = future.result(timeout=10.0)
+                        if not isinstance(result, tuple) or len(result) != 2:
+                            study.tell(trial, state=TrialState.FAIL)
+                        else:
+                            score, attrs = result
+                            if score is None:
+                                study.tell(trial, state=TrialState.PRUNED)
+                            else:
+                                for k, v in attrs.items():
+                                    trial.set_user_attr(k, v)
+                                study.tell(trial, score)
+                    except TimeoutError:
+                        _LOG.warning("Trial %d timed out during drain", trial.number)
                         study.tell(trial, state=TrialState.FAIL)
-                    
-                    n_completed += 1
+                    except Exception as exc:  # noqa: BLE001
+                        _LOG.error("Trial %d failed during drain: %s", trial.number, exc)
+                        study.tell(trial, state=TrialState.FAIL)
 
         except KeyboardInterrupt:
             print("[tune] interrupted; partial study preserved", flush=True)
             for future in active_futures:
                 future.cancel()
+            for trial in active_futures.values():
+                try:
+                    study.tell(trial, state=TrialState.FAIL)
+                except Exception:  # noqa: BLE001
+                    pass
+            active_futures.clear()
         except Exception:
             print("[tune] optimization failed:", flush=True)
             traceback.print_exc()
+            for trial in active_futures.values():
+                try:
+                    study.tell(trial, state=TrialState.FAIL)
+                except Exception:  # noqa: BLE001
+                    pass
+            active_futures.clear()
 
     complete_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
     if complete_trials:
