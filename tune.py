@@ -63,7 +63,7 @@ except RuntimeError:
     # start method already locked by a prior call; that is fine.
     pass
 
-from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED, TimeoutError
 import optuna
 from optuna.samplers import TPESampler
 from optuna.trial import TrialState
@@ -509,6 +509,28 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
                         study.tell(trial, state=TrialState.FAIL)
                     
                     n_completed += 1
+
+            if active_futures:
+                print(f"[tune] Main loop exited. Draining {len(active_futures)} pending futures...", flush=True)
+                for future, trial in list(active_futures.items()):
+                    try:
+                        result = future.result(timeout=10.0)
+                        if not isinstance(result, tuple) or len(result) != 2:
+                            study.tell(trial, state=TrialState.FAIL)
+                        else:
+                            score, attrs = result
+                            if score is None:
+                                study.tell(trial, state=TrialState.PRUNED)
+                            else:
+                                for k, v in attrs.items():
+                                    trial.set_user_attr(k, v)
+                                study.tell(trial, score)
+                    except TimeoutError:
+                        _LOG.warning("Trial %d timed out during drain", trial.number)
+                        study.tell(trial, state=TrialState.FAIL)
+                    except Exception as exc:  # noqa: BLE001
+                        _LOG.error("Trial %d failed during drain: %s", trial.number, exc)
+                        study.tell(trial, state=TrialState.FAIL)
 
         except KeyboardInterrupt:
             print("[tune] interrupted; partial study preserved", flush=True)
