@@ -183,8 +183,7 @@ def _select_match_shape(rng: random.Random, ffa_prob: float) -> str:
 def _build_agents(controlled: Any, shape: str, opponent_names: Sequence[str]) -> List[Any]:
     """Build a Kaggle agent list with the controlled agent at index 0."""
 
-    return resolve_agent_list(controlled, opponent_names) if shape == "1v1" \
-        else resolve_agent_list(controlled, opponent_names)
+    return resolve_agent_list(controlled, opponent_names)
 
 
 def _play_match(agents: List[Any], seed: int, episode_steps: int,
