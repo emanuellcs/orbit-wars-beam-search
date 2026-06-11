@@ -74,8 +74,11 @@ from optuna.trial import TrialState
 # Kaggle environment's 1-second actTimeout then deadlocks on the slow
 # response. The Kaggle runtime is unaffected because it loads main.py as
 # a fresh module without this guard.
-import orbit_engine  # noqa: E402  (must come after the spawn policy lock)
-orbit_engine.set_search_thread_limit(1)
+try:
+    import orbit_engine  # noqa: E402  (must come after the spawn policy lock)
+    orbit_engine.set_search_thread_limit(1)
+except ModuleNotFoundError:
+    orbit_engine = None
 
 # Configure quiet logging: optuna is chatty by default.
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -330,6 +333,17 @@ def _evaluate_trial(trial_number: int, hp: Dict[str, Any], args: argparse.Namesp
     if deadline.exceeded():
         return None, {}
 
+    # Bulletproof the project root in sys.path for spawn workers. Even though
+    # the module-level code already inserts it, a worker that imports tune
+    # from a different cwd may not have it. This guarantees that ``import main``
+    # and ``from opponents import ...`` resolve inside the worker process.
+    import sys as _sys
+    _worker_root = _sys.path[0] if _sys.path else None
+    if _worker_root is None or not os.path.isdir(os.path.join(_worker_root, "src")):
+        _alt_root = os.path.dirname(os.path.abspath(__file__))
+        if _alt_root not in _sys.path:
+            _sys.path.insert(0, _alt_root)
+
     # Force the C++ search to use a single worker thread per process so the
     # ``n_jobs`` parallel trials don't oversubscribe the host machine. The
     # ``search_threads`` kwarg is special: it does not change the SearchConfig
@@ -463,18 +477,25 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
                 for future in done:
                     trial = active_futures.pop(future)
                     try:
-                        score, attrs = future.result()
-                        if score is None:
-                            study.tell(trial, state=TrialState.PRUNED)
-                            print(f"[tune] trial {trial.number} pruned (deadline)", flush=True)
+                        result = future.result()
+                        if not isinstance(result, tuple) or len(result) != 2:
+                            _LOG.error(
+                                "Trial %d returned unexpected type %s – expected (score, attrs) tuple",
+                                trial.number, type(result),
+                            )
+                            study.tell(trial, state=TrialState.FAIL)
                         else:
-                            for k, v in attrs.items():
-                                trial.set_user_attr(k, v)
-                            study.tell(trial, score)
-                            print(f"[tune] trial {trial.number} completed score={score:.2f}", flush=True)
-                    except Exception as exc:
-                        print(f"[tune] trial {trial.number} raised exception: {exc}", flush=True)
-                        traceback.print_exc()
+                            score, attrs = result
+                            if score is None:
+                                study.tell(trial, state=TrialState.PRUNED)
+                                print(f"[tune] trial {trial.number} pruned (deadline)", flush=True)
+                            else:
+                                for k, v in attrs.items():
+                                    trial.set_user_attr(k, v)
+                                study.tell(trial, score)
+                                print(f"[tune] trial {trial.number} completed score={score:.2f}", flush=True)
+                    except Exception:
+                        _LOG.error("Trial %d failed:\n%s", trial.number, traceback.format_exc())
                         study.tell(trial, state=TrialState.FAIL)
                     
                     n_completed += 1
@@ -487,11 +508,19 @@ def main_cli(argv: Optional[Sequence[str]] = None) -> int:
             print("[tune] optimization failed:", flush=True)
             traceback.print_exc()
 
-    print("[tune] best value:", study.best_value if study.trials else "N/A")
-    print("[tune] best params:")
-    if study.trials:
+    complete_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+    if complete_trials:
+        print(f"[tune] best value: {study.best_value}")
+        print("[tune] best params:")
         for key, value in study.best_params.items():
             print(f"  {key} = {value}")
+    else:
+        _LOG.error(
+            "ALL %d trials FAILED – no completed trials. Study has %d PRUNED + %d FAIL.",
+            len(study.trials),
+            sum(1 for t in study.trials if t.state == TrialState.PRUNED),
+            sum(1 for t in study.trials if t.state == TrialState.FAIL),
+        )
     return 0
 
 
