@@ -27,7 +27,6 @@ except Exception as exc:  # pragma: no cover
 
 
 _ENGINES = {}
-_HYPERPARAMS = {}
 _JIT_ATTEMPTED = False
 try:
     _ROOT = Path(__file__).resolve().parent
@@ -35,13 +34,38 @@ except NameError:
     _ROOT = Path(os.getcwd()).resolve()
 
 
+def _load_champion(champion_key="champion"):
+    """Load a tuned champion from ``config/hyperparameters.json``.
+
+    The config file is the single source of truth for search limits, evaluator
+    weights, and candidate weights.  When it is absent the native engine keeps
+    its compiled-in defaults.  ``champion`` holds the 2-player build and
+    ``champion_4p`` the four-player build.
+    """
+    try:
+        import json
+
+        data = json.loads((_ROOT / "config" / "hyperparameters.json").read_text())
+    except Exception:
+        return {}
+    params = dict(data.get(champion_key, {}))
+    params.pop("search_threads", None)
+    return params
+
+
+_CHAMPION = _load_champion("champion")
+_CHAMPION_4P = _load_champion("champion_4p") or _CHAMPION
+_HYPERPARAMS = {}
+_FORMAT = None
+
+
 _ALLOWED_INT_HYPERPARAMS = ("beam_width", "search_depth", "rollout_horizon", "hard_stop_ms")
 _ALLOWED_WEIGHT_KEYS = (
     "ship", "production", "territory_own", "territory_opp", "threat",
-    "comet_owned", "comet_enemy", "comet_neutral",
+    "comet_owned", "comet_enemy", "comet_neutral", "timeline",
     "owner_enemy", "owner_neutral", "owner_self",
     "comet_bonus", "prod_per_unit",
-    "kind_exact", "kind_over", "kind_all_safe", "kind_harass",
+    "kind_exact", "kind_over", "kind_all_safe", "kind_harass", "kind_reinforce",
     "eta_discount", "ship_cost",
 )
 _ALLOWED_BOOL_HYPERPARAMS = ()
@@ -124,6 +148,7 @@ def _compile_native_engine():
         "-ffast-math",
         "-march=native",
         "-pthread",
+        "-Isrc/include",
         "-Isrc",
         f"-I{pybind_include}",
     ]
@@ -250,12 +275,21 @@ def get_hyperparameters():
     return dict(_HYPERPARAMS)
 
 
-def _apply_hyperparams_to_engine(engine):
-    """Apply the module-level hyperparameter dict to a freshly built engine."""
+def _apply_hyperparams_to_engine(engine, obs=None):
+    """Apply the active hyperparameter dict to a freshly built engine.
 
-    if not _HYPERPARAMS or engine is None:
-        return
-    engine_kwargs = {k: v for k, v in _HYPERPARAMS.items() if k != "search_threads"}
+    When the tuning harness injected explicit parameters those take precedence;
+    otherwise the champion matching the observed player count is used.
+    """
+
+    global _FORMAT
+    if obs is not None and _FORMAT is None:
+        planets = _get(obs, "planets", []) or []
+        owners = {int(p[1]) for p in planets if int(p[1]) >= 0}
+        _FORMAT = 4 if len(owners) >= 3 else 2
+
+    params = _HYPERPARAMS or (_CHAMPION_4P if _FORMAT == 4 else _CHAMPION)
+    engine_kwargs = {k: v for k, v in params.items() if k != "search_threads"}
     if engine_kwargs:
         engine.set_hyperparameters(**engine_kwargs)
 
@@ -335,7 +369,7 @@ def agent(obs, config=None):
     engine = _ENGINES.get(player)
     if engine is None:
         engine = orbit_engine.Engine(player)
-        _apply_hyperparams_to_engine(engine)
+        _apply_hyperparams_to_engine(engine, obs)
         _ENGINES[player] = engine
     step = int(_get(obs, "step", 0))
     engine.update_observation(obs)

@@ -1,12 +1,3 @@
-/**
- * @file orbit_engine_state.cpp
- * @brief Observation ingestion and fixed-buffer state reconstruction.
- *
- * This file converts a Python/Kaggle observation snapshot into the engine's SoA
- * representation. It also reconstructs orbit metadata and attaches comet path
- * indices so simulation and search can predict future positions without further
- * Python interaction.
- */
 #include "orbit_engine.hpp"
 
 #include "geometry.hpp"
@@ -431,3 +422,4 @@ bool GameState::is_active_player(int owner_value) const {
 }
 
 }  // namespace orbit
+

@@ -1,12 +1,3 @@
-/**
- * @file orbit_engine_sim.cpp
- * @brief Fixed-buffer Orbit Wars simulator and turn-order implementation.
- *
- * The simulator mirrors the Kaggle rules closely enough for search rollouts:
- * comet expiration, launch legality, production, continuous fleet movement,
- * moving-planet sweeps, combat, and terminal checks. All transient state uses
- * stack or fixed arrays so cloned rollouts remain predictable.
- */
 #include "orbit_engine.hpp"
 
 #include "geometry.hpp"
@@ -89,7 +80,7 @@ void process_launches(GameState& state, const LaunchList& launches) {
                               state.planets.y[static_cast<size_t>(source)]};
         const Vec2 spawn = point_on_heading(
             source_pos, launch.angle,
-            state.planets.radius[static_cast<size_t>(source)] + 1.0e-3);
+            state.planets.radius[static_cast<size_t>(source)] + 0.1);
         state.fleets.add(-1, state.planets.owner[static_cast<size_t>(source)],
                          spawn.x, spawn.y, launch.angle, launch.from_planet_id, launch.ships);
     }
@@ -164,13 +155,20 @@ void resolve_planet_combats(GameState& state, const CombatQueue& queue) {
 }
 
 /**
- * @brief Move all fleets one tick and queue direct planet collisions.
+ * @brief Move all fleets one tick using the environment's collision model.
  * @param state Mutable game state.
  * @param queue Combat queue receiving planet arrivals.
- * @note Each fleet segment is tested continuously against the sun, board exit,
- *       and all live planets; the earliest collision wins.
+ * @param old_pos Planet centers at tick start.
+ * @param next_pos Planet centers at tick end (linearised chord / comet sample).
+ * @param check_collision Per-planet flag; false only for a comet's first placement.
+ * @note Precedence mirrors the Kaggle engine exactly: planets are tested first
+ *       with a relative swept-pair (so planet capture beats bounds/sun), then
+ *       board bounds, then the sun. A fleet is removed at the first hit.
  */
-void move_fleets(GameState& state, CombatQueue& queue) {
+void move_fleets(GameState& state, CombatQueue& queue,
+                 const std::array<Vec2, MAX_PLANETS>& old_pos,
+                 const std::array<Vec2, MAX_PLANETS>& next_pos,
+                 const std::array<uint8_t, MAX_PLANETS>& check_collision) {
     for (int f = 0; f < state.fleets.count; ++f) {
         if (state.fleets.alive[static_cast<size_t>(f)] == 0) {
             continue;
@@ -181,76 +179,64 @@ void move_fleets(GameState& state, CombatQueue& queue) {
         const double speed = state.fleets.speed[static_cast<size_t>(f)];
         const Vec2 end{start.x + std::cos(angle) * speed, start.y + std::sin(angle) * speed};
 
-        double best_t = 2.0;
-        int best_planet = -1;
-        bool sun_hit = false;
-        double t = 0.0;
-        if (segment_circle_hit(start, end, Vec2{CENTER_X, CENTER_Y}, SUN_RADIUS, t)) {
-            best_t = t;
-            sun_hit = true;
-        }
-        if (segment_exits_board(start, end, t) && t < best_t - 1.0e-9) {
-            best_t = t;
-            best_planet = -1;
-            sun_hit = false;
-        }
+        bool removed = false;
         for (int p = 0; p < state.planets.count; ++p) {
-            if (state.planets.alive[static_cast<size_t>(p)] == 0) {
+            if (state.planets.alive[static_cast<size_t>(p)] == 0 ||
+                check_collision[static_cast<size_t>(p)] == 0) {
                 continue;
             }
-            const Vec2 center{state.planets.x[static_cast<size_t>(p)],
-                              state.planets.y[static_cast<size_t>(p)]};
-            if (!segment_circle_hit(start, end, center, state.planets.radius[static_cast<size_t>(p)], t)) {
-                continue;
-            }
-            const bool earlier = t < best_t - 1.0e-9;
-            const bool tie_planet = std::abs(t - best_t) <= 1.0e-9 && !sun_hit &&
-                                    (best_planet < 0 ||
-                                     state.planets.id[static_cast<size_t>(p)] <
-                                         state.planets.id[static_cast<size_t>(best_planet)]);
-            // Equal-time planet hits are made deterministic by planet id. This
-            // avoids worker-to-worker divergence when a fleet grazes two bodies.
-            if (earlier || tie_planet) {
-                best_t = t;
-                best_planet = p;
-                sun_hit = false;
+            if (swept_pair_hit(start, end, old_pos[static_cast<size_t>(p)],
+                               next_pos[static_cast<size_t>(p)],
+                               state.planets.radius[static_cast<size_t>(p)])) {
+                queue.add(p, state.fleets.owner[static_cast<size_t>(f)],
+                          state.fleets.ships[static_cast<size_t>(f)]);
+                state.fleets.remove(f);
+                removed = true;
+                break;
             }
         }
-
-        if (sun_hit) {
-            state.fleets.remove(f);
-        } else if (best_planet >= 0) {
-            queue.add(best_planet, state.fleets.owner[static_cast<size_t>(f)],
-                      state.fleets.ships[static_cast<size_t>(f)]);
-            state.fleets.remove(f);
-        } else if (best_t <= 1.0) {
-            state.fleets.remove(f);
-        } else {
-            state.fleets.x[static_cast<size_t>(f)] = end.x;
-            state.fleets.y[static_cast<size_t>(f)] = end.y;
+        if (removed) {
+            continue;
         }
+        if (!detail::inside_board(end)) {
+            state.fleets.remove(f);
+            continue;
+        }
+        if (point_to_segment_distance(Vec2{CENTER_X, CENTER_Y}, start, end) < SUN_RADIUS) {
+            state.fleets.remove(f);
+            continue;
+        }
+        state.fleets.x[static_cast<size_t>(f)] = end.x;
+        state.fleets.y[static_cast<size_t>(f)] = end.y;
     }
 }
 
 /**
- * @brief Advance orbiting planets and comets, sweeping them over fleet points.
+ * @brief Compute each planet's tick-end position up front (environment model).
  * @param state Mutable game state.
- * @param old_pos Planet centers before body motion.
- * @param queue Combat queue receiving swept fleet arrivals.
- * @note Fleets move first; this pass catches stationary fleet positions that
- *       are overtaken by a moving planet or comet during the same tick.
+ * @param old_pos Output planet centers at tick start.
+ * @param next_pos Output planet centers at tick end.
+ * @param check_collision Output per-planet collision flag (false on first comet placement).
+ * @param expired Output per-planet flag for comets whose path ended this tick.
+ * @note Orbiting planets move along their orbit chord, comets advance one path
+ *       sample, and a comet that finishes its path stays put for the tick so
+ *       fleets can still hit it, then is removed after fleet movement.
  */
-void advance_planets_and_comets(GameState& state, const std::array<Vec2, MAX_PLANETS>& old_pos,
-                                CombatQueue& queue) {
+void compute_planet_motion(GameState& state, std::array<Vec2, MAX_PLANETS>& old_pos,
+                           std::array<Vec2, MAX_PLANETS>& next_pos,
+                           std::array<uint8_t, MAX_PLANETS>& check_collision,
+                           std::array<uint8_t, MAX_PLANETS>& expired) {
     for (int g = 0; g < state.comets.group_count; ++g) {
         ++state.comets.path_index[static_cast<size_t>(g)];
     }
-
     for (int p = 0; p < state.planets.count; ++p) {
         if (state.planets.alive[static_cast<size_t>(p)] == 0) {
             continue;
         }
-        Vec2 next{state.planets.x[static_cast<size_t>(p)], state.planets.y[static_cast<size_t>(p)]};
+        old_pos[static_cast<size_t>(p)] =
+            Vec2{state.planets.x[static_cast<size_t>(p)], state.planets.y[static_cast<size_t>(p)]};
+        next_pos[static_cast<size_t>(p)] = old_pos[static_cast<size_t>(p)];
+        check_collision[static_cast<size_t>(p)] = 1;
         if (state.planets.is_comet[static_cast<size_t>(p)] != 0) {
             const int group = state.planets.comet_group[static_cast<size_t>(p)];
             const int slot = state.planets.comet_slot[static_cast<size_t>(p)];
@@ -260,42 +246,19 @@ void advance_planets_and_comets(GameState& state, const std::array<Vec2, MAX_PLA
                 const int idx = state.comets.path_index[static_cast<size_t>(group)];
                 if (idx >= 0 && idx < len) {
                     const int path = state.comets.path_index_flat(group, slot, idx);
-                    next.x = state.comets.path_x[static_cast<size_t>(path)];
-                    next.y = state.comets.path_y[static_cast<size_t>(path)];
+                    next_pos[static_cast<size_t>(p)] =
+                        Vec2{state.comets.path_x[static_cast<size_t>(path)],
+                             state.comets.path_y[static_cast<size_t>(path)]};
+                    /* First placement starts from an off-board placeholder, so
+                     * fleets must not be able to collide with it this tick. */
+                    check_collision[static_cast<size_t>(p)] =
+                        old_pos[static_cast<size_t>(p)].x >= 0.0 ? 1U : 0U;
+                } else {
+                    expired[static_cast<size_t>(p)] = 1;
                 }
             }
         } else if (state.planets.is_orbiting[static_cast<size_t>(p)] != 0) {
-            next = state.planet_position_after(p, 1.0);
-        }
-
-        const Vec2 before = old_pos[static_cast<size_t>(p)];
-        state.planets.x[static_cast<size_t>(p)] = next.x;
-        state.planets.y[static_cast<size_t>(p)] = next.y;
-
-        if (std::abs(before.x - next.x) <= 1.0e-12 && std::abs(before.y - next.y) <= 1.0e-12) {
-            continue;
-        }
-        for (int f = 0; f < state.fleets.count; ++f) {
-            if (state.fleets.alive[static_cast<size_t>(f)] == 0) {
-                continue;
-            }
-            const Vec2 fleet_pos{state.fleets.x[static_cast<size_t>(f)],
-                                 state.fleets.y[static_cast<size_t>(f)]};
-            bool hit = false;
-            if (state.planets.is_orbiting[static_cast<size_t>(p)] != 0) {
-                hit = swept_point_by_orbit_arc(
-                    fleet_pos, before, next, state.planets.orbit_radius[static_cast<size_t>(p)],
-                    state.planets.radius[static_cast<size_t>(p)],
-                    state.planets.angular_velocity[static_cast<size_t>(p)]);
-            } else {
-                hit = swept_point_by_segment(
-                    fleet_pos, before, next, state.planets.radius[static_cast<size_t>(p)]);
-            }
-            if (hit) {
-                queue.add(p, state.fleets.owner[static_cast<size_t>(f)],
-                          state.fleets.ships[static_cast<size_t>(f)]);
-                state.fleets.remove(f);
-            }
+            next_pos[static_cast<size_t>(p)] = state.planet_position_after(p, 1.0);
         }
     }
 }
@@ -315,7 +278,7 @@ void update_terminal(GameState& state) {
             last_owner = owner;
         }
     }
-    if (state.step >= EPISODE_STEPS || active_count <= 1) {
+    if (state.step >= EPISODE_STEPS - 1 || active_count <= 1) {
         state.done = true;
         state.winner = active_count == 1 ? last_owner : -1;
     }
@@ -354,16 +317,32 @@ void OrbitSim::step(const LaunchList& launches) {
     process_launches(state, launches);
     produce(state);
 
+    std::array<Vec2, MAX_PLANETS> old_pos{};
+    std::array<Vec2, MAX_PLANETS> next_pos{};
+    std::array<uint8_t, MAX_PLANETS> check_collision{};
+    std::array<uint8_t, MAX_PLANETS> expired{};
+    compute_planet_motion(state, old_pos, next_pos, check_collision, expired);
+
     CombatQueue queue{};
     queue.clear();
-    move_fleets(state, queue);
+    move_fleets(state, queue, old_pos, next_pos, check_collision);
 
-    std::array<Vec2, MAX_PLANETS> old_pos{};
     for (int p = 0; p < state.planets.count; ++p) {
-        old_pos[static_cast<size_t>(p)] =
-            Vec2{state.planets.x[static_cast<size_t>(p)], state.planets.y[static_cast<size_t>(p)]};
+        if (state.planets.alive[static_cast<size_t>(p)] == 0) {
+            continue;
+        }
+        state.planets.x[static_cast<size_t>(p)] = next_pos[static_cast<size_t>(p)].x;
+        state.planets.y[static_cast<size_t>(p)] = next_pos[static_cast<size_t>(p)].y;
     }
-    advance_planets_and_comets(state, old_pos, queue);
+
+    for (int p = 0; p < state.planets.count; ++p) {
+        if (expired[static_cast<size_t>(p)] != 0 && state.planets.alive[static_cast<size_t>(p)] != 0) {
+            state.planets.alive[static_cast<size_t>(p)] = 0;
+            state.planets.owner[static_cast<size_t>(p)] = -1;
+            state.planets.ships[static_cast<size_t>(p)] = 0;
+        }
+    }
+
     resolve_planet_combats(state, queue);
 
     ++state.step;
@@ -371,3 +350,4 @@ void OrbitSim::step(const LaunchList& launches) {
 }
 
 }  // namespace orbit
+

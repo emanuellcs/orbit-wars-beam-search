@@ -54,7 +54,7 @@ pybind11_add_module(orbit_engine
 )
 
 # Keep includes private: only the extension target consumes src/*.hpp.
-target_include_directories(orbit_engine PRIVATE src)
+target_include_directories(orbit_engine PRIVATE src/include src)
 
 # Link the platform thread library required by std::thread in search.
 target_link_libraries(orbit_engine PRIVATE Threads::Threads)

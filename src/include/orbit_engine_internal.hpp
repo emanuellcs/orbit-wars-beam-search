@@ -1,11 +1,3 @@
-/**
- * @file orbit_engine_internal.hpp
- * @brief Internal math and indexing helpers shared by native engine modules.
- *
- * These functions are intentionally tiny and allocation-free. They centralize
- * angle normalization, comet array flattening, and deterministic seed mixing so
- * simulation, geometry, and search agree on low-level terminology and indexing.
- */
 #pragma once
 
 #include "orbit_engine.hpp"
@@ -25,10 +17,6 @@ constexpr double EPS = 1.0e-9;
 /// @param hi Inclusive upper bound.
 /// @return value constrained to [lo, hi].
 double clamp(double value, double lo, double hi);
-/// @brief Square a scalar without invoking generic power functions.
-/// @param value Scalar to square.
-/// @return value * value.
-double sqr(double value);
 /// @brief Compute Euclidean distance between two board points.
 /// @param a First point.
 /// @param b Second point.
@@ -70,3 +58,4 @@ int comet_path_flat(int group, int slot, int point);
 uint64_t mix64(uint64_t value);
 
 }  // namespace orbit::detail
+

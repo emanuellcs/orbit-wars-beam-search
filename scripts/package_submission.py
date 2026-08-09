@@ -11,7 +11,7 @@ from pathlib import Path
 import tarfile
 
 # Repository root used as the packaging base directory.
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 # Default Kaggle submission archive path.
 OUT = ROOT / "submission.tar.gz"
@@ -65,8 +65,9 @@ def build_package() -> Path:
 
         for path in sorted((ROOT / "src").glob("*.cpp")) + sorted(
             (ROOT / "src").glob("*.hpp")
-        ):
-            _add_file(tar, path, Path("src") / path.name)
+        ) + sorted((ROOT / "src" / "include").glob("*.hpp")):
+            arc_dir = Path("src") / "include" if path.parent.name == "include" else Path("src")
+            _add_file(tar, path, arc_dir / path.name)
 
         for path in sorted(pybind_include.rglob("*")):
             if path.is_file():

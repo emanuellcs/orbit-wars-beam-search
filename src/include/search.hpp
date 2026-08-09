@@ -1,15 +1,3 @@
-/**
- * @file search.hpp
- * @brief Root-level fixed-buffer beam-search configuration and entrypoint.
- *
- * Search evaluates a bounded set of packed macro-actions with deterministic
- * rollouts. The parameters are clamped at runtime to keep CPU and memory usage
- * predictable inside Kaggle's per-turn deadline.
- *
- * @note ``SearchConfig`` itself is declared in ``orbit_engine.hpp`` so that
- *       ``Engine`` can hold a value-typed member without a circular include.
- *       This header owns the search entrypoint and the runtime thread cap.
- */
 #pragma once
 
 #include "orbit_engine.hpp"
@@ -36,3 +24,4 @@ LaunchList beam_search_action(const GameState& state, const SearchConfig& config
                               int time_budget_ms, uint64_t seed);
 
 }  // namespace orbit
+

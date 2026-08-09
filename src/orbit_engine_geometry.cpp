@@ -1,11 +1,3 @@
-/**
- * @file orbit_engine_geometry.cpp
- * @brief Geometry implementation for fleet motion, swept collisions, and intercepts.
- *
- * The search relies on analytic geometry instead of sampled headings. These
- * routines compute continuous segment hits and bounded moving-target
- * time-to-intercept values while remaining allocation-free on the hot path.
- */
 #include "geometry.hpp"
 
 #include "orbit_engine_internal.hpp"
@@ -176,6 +168,37 @@ bool swept_point_by_segment(Vec2 point, Vec2 a, Vec2 b, double radius) {
     return detail::distance(point, closest) <= radius + 1.0e-9;
 }
 
+double point_to_segment_distance(Vec2 p, Vec2 v, Vec2 w) {
+    const double l2 = (v.x - w.x) * (v.x - w.x) + (v.y - w.y) * (v.y - w.y);
+    if (l2 <= detail::EPS) {
+        return detail::distance(p, v);
+    }
+    const double t = detail::clamp(((p.x - v.x) * (w.x - v.x) + (p.y - v.y) * (w.y - v.y)) / l2, 0.0, 1.0);
+    const Vec2 projection{v.x + t * (w.x - v.x), v.y + t * (w.y - v.y)};
+    return detail::distance(p, projection);
+}
+
+bool swept_pair_hit(Vec2 A, Vec2 B, Vec2 P0, Vec2 P1, double r) {
+    const double d0x = A.x - P0.x;
+    const double d0y = A.y - P0.y;
+    const double dvx = (B.x - A.x) - (P1.x - P0.x);
+    const double dvy = (B.y - A.y) - (P1.y - P0.y);
+    const double a = dvx * dvx + dvy * dvy;
+    const double b = 2.0 * (d0x * dvx + d0y * dvy);
+    const double c = d0x * d0x + d0y * d0y - r * r;
+    if (a < 1.0e-12) {
+        return c <= 0.0;
+    }
+    const double disc = b * b - 4.0 * a * c;
+    if (disc < 0.0) {
+        return false;
+    }
+    const double sq = std::sqrt(disc);
+    const double t1 = (-b - sq) / (2.0 * a);
+    const double t2 = (-b + sq) / (2.0 * a);
+    return t2 >= 0.0 && t1 <= 1.0;
+}
+
 /**
  * @brief Test a point against a circular body swept along an orbital arc.
  * @param point Stationary point to test.
@@ -258,13 +281,16 @@ bool solve_intercept(const GameState& state, int source_index, int target_index,
         const Vec2 target{state.planets.x[static_cast<size_t>(target_index)],
                           state.planets.y[static_cast<size_t>(target_index)]};
         tau = std::max(1.0, detail::distance(source, target) / speed);
+        if (tau > 120.0) {
+            return false;
+        }
         Vec2 spawn = source;
         double aim = heading_to(spawn, target);
         // Launches spawn just outside the source radius, so aiming from the
         // center would be slightly biased for close planets. Two refinement
         // passes are enough because the spawn offset is tiny.
         for (int i = 0; i < 2; ++i) {
-            spawn = point_on_heading(source, aim, state.planets.radius[static_cast<size_t>(source_index)] + 1.0e-3);
+            spawn = point_on_heading(source, aim, state.planets.radius[static_cast<size_t>(source_index)] + 0.1);
             aim = heading_to(spawn, target);
         }
         angle = aim;
@@ -331,11 +357,31 @@ bool solve_intercept(const GameState& state, int source_index, int target_index,
     // Re-aim from the actual spawn point after tau is known. Three fixed passes
     // keep the correction deterministic and cheaper than another root solve.
     for (int i = 0; i < 3; ++i) {
-        spawn = point_on_heading(source, aim, state.planets.radius[static_cast<size_t>(source_index)] + 1.0e-3);
+        spawn = point_on_heading(source, aim, state.planets.radius[static_cast<size_t>(source_index)] + 0.1);
         aim = heading_to(spawn, target);
     }
     angle = aim;
-    return tau >= 1.0 && tau <= 120.0;
+
+    if (tau < 1.0 || tau > 120.0) {
+        return false;
+    }
+    /* A comet is removed when its path is exhausted, so a fleet arriving after
+     * that point would find nothing to capture. Reject such optimistic shots. */
+    if (state.planets.is_comet[static_cast<size_t>(target_index)] != 0) {
+        const int group = state.planets.comet_group[static_cast<size_t>(target_index)];
+        const int slot = state.planets.comet_slot[static_cast<size_t>(target_index)];
+        if (group >= 0 && slot >= 0) {
+            const int flat = state.comets.slot_index(group, slot);
+            const int len = state.comets.path_len[static_cast<size_t>(flat)];
+            const double remaining =
+                static_cast<double>(len) - static_cast<double>(state.comets.path_index[static_cast<size_t>(group)]);
+            if (remaining < tau) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 }  // namespace orbit
+

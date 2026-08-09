@@ -1,0 +1,7 @@
+{
+  "opponents": [
+    { "name": "baseline", "kind": "handcrafted", "params": {}, "rating": 1500.0, "note": "Nearest-target policy with 4x production reserve." },
+    { "name": "greedy", "kind": "handcrafted", "params": {}, "rating": 1500.0, "note": "Nearest-target policy with 3x production reserve." },
+    { "name": "mirror", "kind": "handcrafted", "params": {}, "rating": 1500.0, "note": "Mirrored-coordinate targeting policy." }
+  ]
+}
