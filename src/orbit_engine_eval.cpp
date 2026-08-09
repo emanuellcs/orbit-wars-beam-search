@@ -1,11 +1,3 @@
-/**
- * @file orbit_engine_eval.cpp
- * @brief Deterministic heuristic evaluation for search rollouts.
- *
- * The evaluator is intentionally dense and cheap. It rewards material,
- * production, central territory, and comet opportunity while penalizing
- * near-term incoming threats against owned planets.
- */
 #include "eval.hpp"
 
 #include "geometry.hpp"
@@ -28,6 +20,8 @@ constexpr double COMET_ENEMY_PER_SHIP = 0.2;
 /// @brief Historical neutral-comet proximity curve: ``max(0, 10 - 0.1 * ships)``.
 constexpr double COMET_NEUTRAL_BASE = 10.0;
 constexpr double COMET_NEUTRAL_PER_SHIP = 0.1;
+/// @brief Forward horizon (ticks) for the projected-garrison timeline term.
+constexpr double TIMELINE_HORIZON = 24.0;
 
 /**
  * @brief Compute a production-weighted centrality bonus.
@@ -93,6 +87,7 @@ double evaluate_state_impl(const GameState& state, int player, const EvalWeights
     double opp_prod = 0.0;
     double territory = 0.0;
     double comet_value = 0.0;
+    double timeline = 0.0;
 
     for (int p = 0; p < state.planets.count; ++p) {
         if (state.planets.alive[static_cast<size_t>(p)] == 0) {
@@ -106,6 +101,7 @@ double evaluate_state_impl(const GameState& state, int player, const EvalWeights
             own_ships += ships;
             own_prod += prod;
             territory += weights.territory_own * centrality_value(pos, state.planets.production[static_cast<size_t>(p)]);
+            timeline += ships + prod * TIMELINE_HORIZON;
             if (state.planets.is_comet[static_cast<size_t>(p)] != 0) {
                 comet_value += weights.comet_owned *
                                (COMET_OWNED_BASE + ships * COMET_OWNED_PER_SHIP);
@@ -115,6 +111,7 @@ double evaluate_state_impl(const GameState& state, int player, const EvalWeights
             opp_prod += prod;
             territory -= weights.territory_opp *
                          centrality_value(pos, state.planets.production[static_cast<size_t>(p)]);
+            timeline -= ships + prod * TIMELINE_HORIZON;
             if (state.planets.is_comet[static_cast<size_t>(p)] != 0) {
                 comet_value -= weights.comet_enemy *
                                (COMET_ENEMY_BASE + ships * COMET_ENEMY_PER_SHIP);
@@ -140,7 +137,8 @@ double evaluate_state_impl(const GameState& state, int player, const EvalWeights
            weights.production * (own_prod - opp_prod) +
            territory -
            weights.threat * incoming_threat(state, eval_player) +
-           comet_value;
+           comet_value +
+           weights.timeline * timeline;
 }
 
 }  // namespace
@@ -167,3 +165,4 @@ double evaluate_state(const GameState& state, int player, const EvalWeights& wei
 }
 
 }  // namespace orbit
+

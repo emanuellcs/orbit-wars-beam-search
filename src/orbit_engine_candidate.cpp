@@ -1,11 +1,3 @@
-/**
- * @file orbit_engine_candidate.cpp
- * @brief Tactical launch generation and legal macro-action packing.
- *
- * The search does not sample arbitrary headings. It first creates analytically
- * solved launch packets, ranks them by tactical value, then packs legal
- * multi-launch macro-actions with per-source spend accounting.
- */
 #include "candidate.hpp"
 
 #include "eval.hpp"
@@ -31,34 +23,62 @@ namespace {
  * @note solve_intercept supplies tau and heading so search evaluates meaningful
  *       geometry rather than wasting macro slots on sampled angles.
  */
-void add_packet(const GameState& state, int player, int source, int target, int ships,
+void add_packet(const GameState& state, int player, int source, int target, int ships_hint,
                 PacketKind kind, const CandidateWeights& weights, AtomicLaunchList& out) {
-    if (ships <= 0 || source == target ||
+    if (source == target ||
         state.planets.alive[static_cast<size_t>(source)] == 0 ||
         state.planets.alive[static_cast<size_t>(target)] == 0) {
         return;
     }
     const int available = state.planets.ships[static_cast<size_t>(source)];
-    if (ships > available) {
+    if (available <= 0) {
         return;
     }
+    const int garrison = state.planets.ships[static_cast<size_t>(target)];
+    const int production = state.planets.production[static_cast<size_t>(target)];
+
+    /* Solve the arrival time with a representative size first, then size the
+     * capture against the garrison that will exist on arrival (production is
+     * added every tick the planet is owned).  Sizing matters: a garrison+1
+     * launch usually arrives one production tick too small. */
+    const int guess = std::max(1, ships_hint > 0 ? ships_hint : garrison + 1);
     double eta = 0.0;
     double angle = 0.0;
-    if (!solve_intercept(state, source, target, ships, eta, angle)) {
+    if (!solve_intercept(state, source, target, guess, eta, angle)) {
         return;
     }
+    int ships = 0;
+    if (kind == PacketKind::CaptureExact) {
+        ships = garrison + production * static_cast<int>(std::ceil(eta)) + 1;
+    } else if (kind == PacketKind::CaptureOver) {
+        ships = garrison + production * static_cast<int>(std::ceil(eta)) + 4 * production + 2;
+    } else if (kind == PacketKind::Harass) {
+        ships = 1;
+    } else {  // Reinforce or AllSafe: caller supplies the exact size.
+        ships = ships_hint;
+    }
+    if (ships <= 0 || ships > available) {
+        return;
+    }
+    if (ships != guess && !solve_intercept(state, source, target, ships, eta, angle)) {
+        return;
+    }
+
     const int target_owner = state.planets.owner[static_cast<size_t>(target)];
     const double prod = static_cast<double>(state.planets.production[static_cast<size_t>(target)]);
-    const double owner_bonus = target_owner < 0
-                                  ? weights.owner_neutral
-                                  : (target_owner == player ? weights.owner_self : weights.owner_enemy);
+    const double owner_bonus = kind == PacketKind::Reinforce
+                                   ? 0.0
+                                   : (target_owner < 0
+                                          ? weights.owner_neutral
+                                          : (target_owner == player ? weights.owner_self : weights.owner_enemy));
     const double comet_bonus = state.planets.is_comet[static_cast<size_t>(target)] != 0
                                    ? weights.comet_bonus
                                    : 0.0;
     const double kind_bonus =
         kind == PacketKind::CaptureExact ? weights.kind_exact :
         kind == PacketKind::CaptureOver ? weights.kind_over :
-        kind == PacketKind::AllSafe ? weights.kind_all_safe : weights.kind_harass;
+        kind == PacketKind::AllSafe ? weights.kind_all_safe :
+        kind == PacketKind::Reinforce ? weights.kind_reinforce : weights.kind_harass;
     AtomicLaunch launch{};
     launch.from_planet_id = state.planets.id[static_cast<size_t>(source)];
     launch.source_index = source;
@@ -67,11 +87,16 @@ void add_packet(const GameState& state, int player, int source, int target, int 
     launch.angle = angle;
     launch.eta = eta;
     launch.kind = kind;
-    // This prior prefers production and enemy/comet targets, then discounts
-    // slow arrivals and expensive launches. Rollout evaluation remains the
-    // final arbiter; the prior only controls the fixed candidate frontier.
-    launch.score = owner_bonus + comet_bonus + prod * weights.prod_per_unit + kind_bonus -
-                   eta * weights.eta_discount - static_cast<double>(ships) * weights.ship_cost;
+    // Reinforcement urgency scales with the deficit (more incoming ships means a
+    // bigger send and a higher prior); regular packets keep the production/
+    // ownership/ETA trade-off. Rollout evaluation remains the final arbiter.
+    if (kind == PacketKind::Reinforce) {
+        launch.score = weights.kind_reinforce * (1.0 + static_cast<double>(ships) / 20.0) -
+                       eta * weights.eta_discount;
+    } else {
+        launch.score = owner_bonus + comet_bonus + prod * weights.prod_per_unit + kind_bonus -
+                       eta * weights.eta_discount - static_cast<double>(ships) * weights.ship_cost;
+    }
     out.insert_sorted(launch);
 }
 
@@ -193,17 +218,73 @@ int defensive_reserve(const GameState& state, int source_index, int player) {
 }
 
 /**
+ * @brief Sum enemy ships projected to reach an owned planet within a window.
+ * @param state Current game state.
+ * @param planet_index Owned planet SoA index.
+ * @param player Controlled player id.
+ * @param window Forward projection in ticks.
+ * @return Incoming enemy ship mass.
+ * @note Uses the same segment-circle projection as the evaluator threat term.
+ */
+int incoming_mass(const GameState& state, int planet_index, int player, double window) {
+    int mass = 0;
+    const Vec2 center{state.planets.x[static_cast<size_t>(planet_index)],
+                      state.planets.y[static_cast<size_t>(planet_index)]};
+    for (int f = 0; f < state.fleets.count; ++f) {
+        if (state.fleets.alive[static_cast<size_t>(f)] == 0 ||
+            state.fleets.owner[static_cast<size_t>(f)] == player) {
+            continue;
+        }
+        const Vec2 start{state.fleets.x[static_cast<size_t>(f)],
+                         state.fleets.y[static_cast<size_t>(f)]};
+        const Vec2 end = point_on_heading(start, state.fleets.angle[static_cast<size_t>(f)],
+                                          state.fleets.speed[static_cast<size_t>(f)] * window);
+        double t = 0.0;
+        if (segment_circle_hit(start, end, center, state.planets.radius[static_cast<size_t>(planet_index)], t)) {
+            mass += state.fleets.ships[static_cast<size_t>(f)];
+        }
+    }
+    return mass;
+}
+
+/**
  * @brief Generate all ranked atomic launch candidates for one player.
  * @param state Current game state.
  * @param player Controlled player id.
  * @param weights Tunable scoring weights.
  * @param out Output atomic launch list.
- * @note The packet basis is deliberately small: exact capture, over-capture,
- *       harassment probes, and all-safe pressure from each owned source.
+ * @note Defensive reinforcements are generated first so they compete fairly on
+ *       the frontier, then exact/over/harass/all-safe packets to non-owned
+ *       targets. Capture sizes are time-aware (garrison + production * tau).
  */
 void generate_atomic_launches(const GameState& state, int player,
                               const CandidateWeights& weights, AtomicLaunchList& out) {
     out.clear();
+
+    for (int target = 0; target < state.planets.count; ++target) {
+        if (state.planets.alive[static_cast<size_t>(target)] == 0 ||
+            state.planets.owner[static_cast<size_t>(target)] != player) {
+            continue;
+        }
+        const int incoming = incoming_mass(state, target, player, 24.0);
+        const int garrison = state.planets.ships[static_cast<size_t>(target)];
+        const int deficit = incoming - garrison + 1;
+        if (deficit <= 0) {
+            continue;
+        }
+        for (int source = 0; source < state.planets.count; ++source) {
+            if (source == target ||
+                state.planets.alive[static_cast<size_t>(source)] == 0 ||
+                state.planets.owner[static_cast<size_t>(source)] != player) {
+                continue;
+            }
+            const int reserve = defensive_reserve(state, source, player);
+            if (state.planets.ships[static_cast<size_t>(source)] - reserve >= deficit) {
+                add_packet(state, player, source, target, deficit, PacketKind::Reinforce, weights, out);
+            }
+        }
+    }
+
     for (int source = 0; source < state.planets.count; ++source) {
         if (state.planets.alive[static_cast<size_t>(source)] == 0 ||
             state.planets.owner[static_cast<size_t>(source)] != player) {
@@ -217,17 +298,9 @@ void generate_atomic_launches(const GameState& state, int player,
                 state.planets.owner[static_cast<size_t>(target)] == player) {
                 continue;
             }
-            const int garrison = state.planets.ships[static_cast<size_t>(target)];
-            const int exact = garrison + 1;
-            add_packet(state, player, source, target, exact, PacketKind::CaptureExact, weights, out);
-
-            const int slack = state.planets.production[static_cast<size_t>(target)] * 4 + 2;
-            add_packet(state, player, source, target, exact + slack, PacketKind::CaptureOver, weights, out);
-
+            add_packet(state, player, source, target, 0, PacketKind::CaptureExact, weights, out);
+            add_packet(state, player, source, target, 0, PacketKind::CaptureOver, weights, out);
             add_packet(state, player, source, target, 1, PacketKind::Harass, weights, out);
-            add_packet(state, player, source, target, 3, PacketKind::Harass, weights, out);
-            add_packet(state, player, source, target, 5, PacketKind::Harass, weights, out);
-            add_packet(state, player, source, target, std::min(10, available / 4), PacketKind::Harass, weights, out);
             add_packet(state, player, source, target, all_safe, PacketKind::AllSafe, weights, out);
         }
     }
@@ -314,3 +387,4 @@ void deterministic_launches_for_owner(const GameState& state, int owner,
 }
 
 }  // namespace orbit
+

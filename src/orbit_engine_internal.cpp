@@ -1,11 +1,3 @@
-/**
- * @file orbit_engine_internal.cpp
- * @brief Shared scalar math, angle normalization, comet indexing, and seed mixing.
- *
- * These helpers are intentionally small, deterministic, and allocation-free.
- * Centralizing them keeps SoA indexing and angular wrap logic consistent across
- * simulator, geometry, candidate generation, and search.
- */
 #include "orbit_engine_internal.hpp"
 
 #include <cmath>
@@ -30,19 +22,9 @@ double clamp(double value, double lo, double hi) {
 }
 
 /**
- * @brief Square a scalar.
- * @param value Scalar input.
- * @return value multiplied by itself.
- */
-double sqr(double value) {
-    return value * value;
-}
-
-/**
  * @brief Compute Euclidean distance between two points.
  * @param a First point.
  * @param b Second point.
- * @return Distance in board units.
  */
 double distance(Vec2 a, Vec2 b) {
     return std::hypot(a.x - b.x, a.y - b.y);
@@ -137,3 +119,4 @@ uint64_t mix64(uint64_t value) {
 }
 
 }  // namespace orbit::detail
+

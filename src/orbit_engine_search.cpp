@@ -1,11 +1,3 @@
-/**
- * @file orbit_engine_search.cpp
- * @brief Root-parallel fixed-buffer macro-action search.
- *
- * The search evaluates a bounded ranked frontier of macro-actions, simulates a
- * deterministic tactical prefix plus rollout for each, and returns the best
- * legal launch list before the hard deadline.
- */
 #include "search.hpp"
 
 #include "candidate.hpp"
@@ -70,7 +62,8 @@ void fill_deterministic_joint(const GameState& state, LaunchList& joint, int ski
  *       allocation while allowing each worker to mutate an independent state.
  */
 double evaluate_macro(const GameState& root, int player, const MacroAction& macro,
-                      const SearchConfig& config, uint64_t seed) {
+                      const SearchConfig& config, uint64_t seed,
+                      const std::chrono::steady_clock::time_point& deadline) {
     (void)seed;
     OrbitSim sim{};
     sim.state = root;
@@ -89,6 +82,9 @@ double evaluate_macro(const GameState& root, int player, const MacroAction& macr
             }
         }
         sim.step(joint);
+        if ((depth & 7) == 0 && std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
     }
 
     for (int tick = 0; tick < config.rollout_horizon && !sim.state.done; ++tick) {
@@ -99,6 +95,9 @@ double evaluate_macro(const GameState& root, int player, const MacroAction& macr
             }
         }
         sim.step(joint);
+        if ((tick & 7) == 0 && std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
     }
 
     return evaluate_state(sim.state, player, config.eval_weights) + macro.score * 0.05;
@@ -182,14 +181,16 @@ LaunchList beam_search_action(const GameState& state, const SearchConfig& reques
             if (index >= candidate_count) {
                 break;
             }
-            // Check every eight candidates to keep the hot loop cheap while
-            // still respecting the 900 ms action deadline with a small margin.
-            if ((index & 7) == 0 && std::chrono::steady_clock::now() >= deadline) {
+            // Check every few candidates so the hot loop stays cheap while the
+            // deadline is still respected; evaluate_macro also preempts rollouts
+            // internally, so worst-case overshoot stays under one evaluation.
+            if ((index & 3) == 0 && std::chrono::steady_clock::now() >= deadline) {
                 break;
             }
             scores[static_cast<size_t>(index)] =
                 evaluate_macro(state, state.player, macros.items[static_cast<size_t>(index)],
-                               config, detail::mix64(seed + static_cast<uint64_t>(worker_id * 4099 + index)));
+                               config, detail::mix64(seed + static_cast<uint64_t>(worker_id * 4099 + index)),
+                               deadline);
         }
     };
 
@@ -228,3 +229,4 @@ LaunchList beam_search_action(const GameState& state, const SearchConfig& reques
 }
 
 }  // namespace orbit
+

@@ -1,12 +1,3 @@
-/**
- * @file orbit_engine_bindings.cpp
- * @brief pybind11 bridge between Kaggle Python observations and the native engine.
- *
- * The bridge accepts dictionary-style and attribute-style observations, copies
- * rows into fixed-capacity native buffers, and returns plain Python launch lists.
- * All capacity checks happen here before data reaches the zero-allocation C++
- * simulator/search hot path.
- */
 #include "orbit_engine.hpp"
 
 #include "candidate.hpp"
@@ -368,6 +359,7 @@ bool assign_eval_weight(orbit::EvalWeights& target, const std::string& key, doub
     if (key == "comet_owned")     { target.comet_owned = value; return true; }
     if (key == "comet_enemy")     { target.comet_enemy = value; return true; }
     if (key == "comet_neutral")   { target.comet_neutral = value; return true; }
+    if (key == "timeline")        { target.timeline = value; return true; }
     return false;
 }
 
@@ -388,6 +380,7 @@ bool assign_candidate_weight(orbit::CandidateWeights& target, const std::string&
     if (key == "kind_over")       { target.kind_over = value; return true; }
     if (key == "kind_all_safe")   { target.kind_all_safe = value; return true; }
     if (key == "kind_harass")     { target.kind_harass = value; return true; }
+    if (key == "kind_reinforce")  { target.kind_reinforce = value; return true; }
     if (key == "eta_discount")    { target.eta_discount = value; return true; }
     if (key == "ship_cost")       { target.ship_cost = value; return true; }
     return false;
@@ -506,6 +499,7 @@ public:
         out["weight_comet_owned"] = cfg.eval_weights.comet_owned;
         out["weight_comet_enemy"] = cfg.eval_weights.comet_enemy;
         out["weight_comet_neutral"] = cfg.eval_weights.comet_neutral;
+        out["weight_timeline"] = cfg.eval_weights.timeline;
         out["weight_owner_enemy"] = cfg.candidate_weights.owner_enemy;
         out["weight_owner_neutral"] = cfg.candidate_weights.owner_neutral;
         out["weight_owner_self"] = cfg.candidate_weights.owner_self;
@@ -515,6 +509,7 @@ public:
         out["weight_kind_over"] = cfg.candidate_weights.kind_over;
         out["weight_kind_all_safe"] = cfg.candidate_weights.kind_all_safe;
         out["weight_kind_harass"] = cfg.candidate_weights.kind_harass;
+        out["weight_kind_reinforce"] = cfg.candidate_weights.kind_reinforce;
         out["weight_eta_discount"] = cfg.candidate_weights.eta_discount;
         out["weight_ship_cost"] = cfg.candidate_weights.ship_cost;
         return out;
@@ -583,3 +578,4 @@ PYBIND11_MODULE(orbit_engine, m) {
     m.def("get_search_thread_limit", &orbit::search_thread_limit,
           "Process-wide cap on C++ search worker threads.");
 }
+

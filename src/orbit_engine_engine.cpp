@@ -1,11 +1,3 @@
-/**
- * @file orbit_engine_engine.cpp
- * @brief High-level engine facade used by the pybind11 wrapper.
- *
- * This layer keeps Python-facing operations small: load observations, step
- * explicit actions, run native search, and expose the heuristic evaluator. The
- * heavy logic remains in simulator, candidate, search, and evaluation modules.
- */
 #include "orbit_engine.hpp"
 
 #include "eval.hpp"
@@ -108,3 +100,4 @@ void Engine::set_candidate_weights(const CandidateWeights& weights) {
 }
 
 }  // namespace orbit
+
