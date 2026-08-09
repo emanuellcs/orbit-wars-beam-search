@@ -1,15 +1,3 @@
-/**
- * @file candidate.hpp
- * @brief Tactical launch candidate and macro-action packing interfaces.
- *
- * Candidate generation converts the continuous game state into a fixed set of
- * analytically aimed packets. Macro packing then combines those packets while
- * preserving per-source spend legality, giving search a bounded action frontier.
- *
- * @note The tunable ``CandidateWeights`` bundle is declared in
- *       ``orbit_engine.hpp`` so that ``Engine`` can hold it by value without
- *       introducing a circular include.
- */
 #pragma once
 
 #include "orbit_engine.hpp"
@@ -18,7 +6,7 @@ namespace orbit {
 
 /// @brief Tactical category used to bias atomic launch ranking.
 enum class PacketKind : uint8_t {
-    ///< Send exactly garrison + 1 ships to attempt a capture.
+    ///< Send exactly garrison + production * tau + 1 ships to capture on arrival.
     CaptureExact = 0,
     ///< Send capture ships plus production-based slack.
     CaptureOver,
@@ -26,6 +14,8 @@ enum class PacketKind : uint8_t {
     Harass,
     ///< Send all ships above a defensive reserve.
     AllSafe,
+    ///< Defensive reinforcement of a threatened owned planet.
+    Reinforce,
 };
 
 /// @brief One analytically aimed launch packet before macro packing.
@@ -123,3 +113,4 @@ void deterministic_launches_for_owner(const GameState& state, int owner,
                                       const CandidateWeights& weights, LaunchList& out);
 
 }  // namespace orbit
+

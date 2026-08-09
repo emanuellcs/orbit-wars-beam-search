@@ -1,12 +1,3 @@
-/**
- * @file geometry.hpp
- * @brief Continuous-motion geometry primitives for Orbit Wars tactics.
- *
- * The simulator and candidate generator share these helpers for fleet speed,
- * segment-circle collision, swept moving-planet checks, and moving-target
- * interception. Keeping this math native avoids Python overhead and preserves
- * deterministic behavior across rollouts.
- */
 #pragma once
 
 #include "orbit_engine.hpp"
@@ -39,6 +30,22 @@ bool segment_exits_board(Vec2 a, Vec2 b, double& t_exit);
 /// @param radius Swept body radius.
 /// @return true when the point is within radius of the swept segment.
 bool swept_point_by_segment(Vec2 point, Vec2 a, Vec2 b, double radius);
+/// @brief Minimum distance from a point to a closed line segment.
+/// @param p Query point.
+/// @param v Segment start.
+/// @param w Segment end.
+/// @return Euclidean distance to the closest segment point.
+double point_to_segment_distance(Vec2 p, Vec2 v, Vec2 w);
+/// @brief Relative two-body continuous sweep test matching the Kaggle engine.
+/// @param A Fleet position at tick start.
+/// @param B Fleet position at tick end.
+/// @param P0 Planet position at tick start.
+/// @param P1 Planet position at tick end (linearised chord).
+/// @param r Planet collision radius.
+/// @return true when the fleet and planet pass within r at some time in [0,1].
+/// @note Solves the quadratic of the relative motion exactly, mirroring
+///       orbit_wars.swept_pair_hit so rollouts agree with the environment.
+bool swept_pair_hit(Vec2 A, Vec2 B, Vec2 P0, Vec2 P1, double r);
 /// @brief Test whether an orbiting circular body sweeps a point over one tick.
 /// @param point Stationary fleet point.
 /// @param old_center Body center before motion.
@@ -74,3 +81,4 @@ bool solve_intercept(const GameState& state, int source_index, int target_index,
                      int ships, double& tau, double& angle);
 
 }  // namespace orbit
+

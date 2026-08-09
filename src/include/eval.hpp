@@ -1,14 +1,3 @@
-/**
- * @file eval.hpp
- * @brief Heuristic state evaluator used by rollout search and debugging.
- *
- * Evaluation condenses material, production, territory, incoming threat, and
- * comet opportunity into one deterministic score. It is deliberately cheap so
- * many fixed-buffer rollouts can finish before the action deadline.
- *
- * @note The tunable ``EvalWeights`` bundle is declared in ``orbit_engine.hpp``
- *       so that ``Engine`` can hold it by value without a circular include.
- */
 #pragma once
 
 #include "orbit_engine.hpp"
@@ -32,3 +21,4 @@ double evaluate_state(const GameState& state, int player);
 double evaluate_state(const GameState& state, int player, const EvalWeights& weights);
 
 }  // namespace orbit
+
